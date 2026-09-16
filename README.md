@@ -1,67 +1,65 @@
-# Genfare Ridership Reconciler V4
+# Genfare Ridership Reconciler V4.2
 
-Ridership-only reconciliation for GenfareLink versus Legacy Genfare reports.
+Ridership-only Legacy vs GenfareLink reconciliation with a vertical, day-first investigation interface.
 
-V4 changes the output from a flat findings list into a progressive investigation workflow:
+## What changed in V4.2
 
-1. **Raw overall difference** — authoritative Legacy ROUTESUM ridership versus raw GFL ridership.
-2. **By-day drill-down** — identifies which date(s) contain the discrepancy.
-3. **Key/TTP/Preset by day** — compares Legacy fare events with GFL ridership-export records and rider contribution. This distinguishes non-rider categories, configuration/ridership-rule differences, and Legacy display inconsistencies.
-4. **Route → Run → Bus localization** — shows where the category difference lands operationally and detects equal-and-opposite movements consistent with route/run/bus reassignment or Legacy Data Edit.
-5. **Targeted transaction matching** — scans only discrepant day/category pairs and matches on timestamp + bus + fare category to distinguish assignment changes from missing/extra riders.
-6. **External-AI export** — JSON evidence package plus a ready-to-use AI review prompt. There is no AI agent inside the app.
+- Day drill-down controls now run inside a Streamlit fragment. Changing a toggle, Key/TTP dropdown, or drill-down selection refreshes only the investigation area instead of rerunning/resetting the whole app. The upload area and overall reconciliation stay on screen.
 
-## Preferred inputs
+- Removed numbered investigation sections from the main UI.
+- Replaced the wide day table with vertically stacked date cards.
+- Each date shows grouped **Legacy**, **GenfareLink**, and **Difference** metrics.
+- Open any day to reveal the deeper investigation for that day only.
+- Key/TTP tables use grouped headers so Legacy and GFL fields stay together.
+- Route/run/bus tables use the same grouped presentation.
+- Daily Legacy reconstruction now uses fare-use / boarding-candidate transaction types instead of counting issuance/admin transactions as riders.
+- Targeted transaction matching also excludes Legacy issuance/admin rows.
+- Derived daily values are explicitly labeled as derived; ROUTESUM remains the authoritative period total unless a ROUTESUM by route-date report supplies authoritative daily totals.
 
-### Required
-- **GFL Ridership Raw Data CSV**
-- **Legacy EVENT SUMMARY / ROUTESUM** — PDF preferred
+## Reports
 
-### Strongly recommended
-- **Legacy TRANSACTION DETAIL CSV**
+Required:
 
-Transaction Detail is needed for the complete by-day Key/TTP, route/run/bus, and transaction-match workflow.
+1. GFL Ridership Raw Data CSV
+2. Legacy EVENT SUMMARY / ROUTESUM (PDF preferred)
 
-## Ridership behavior
+Strongly recommended:
 
-There are no manual ridership-rule fields. The app infers Legacy ridership behavior from ROUTESUM totals/category counts. The detailed Legacy key-ridership display is treated as evidence, not absolute truth. This allows the app to flag cases such as a key showing 0 on the detailed ridership page while overall/route totals prove that key contributes riders.
+3. Legacy TRANSACTION DETAIL CSV
+
+Revenue is intentionally excluded.
+
+## Investigation flow
+
+The app first displays the overall Legacy/GFL totals. Dates then appear vertically. Each date card shows Legacy, GFL, and differences in separate grouped columns. Opening a day reveals:
+
+- fare-category problems, Keys, TTPs, and all categories;
+- route, run, bus, and exact route+run+bus differences;
+- equal-and-opposite movement detection;
+- targeted transaction matching for unresolved rider categories.
 
 ## Large-file design
 
-- DuckDB scans and aggregates the large GFL and Legacy CSVs.
-- Full raw transaction files are not loaded into pandas.
-- Day/category/route/run/bus aggregate tables are retained in memory.
-- The final transaction-matching pass uses chunked pandas reads and only keeps rows belonging to already-discrepant day/category pairs.
-- Upload limit is configured to 1 GB per file in `.streamlit/config.toml`.
+DuckDB performs the main CSV scans and aggregations so large raw exports do not need to be loaded into pandas in full. Transaction matching performs a second targeted scan only for discrepant day/category combinations.
 
-## Local run
+## Railway
+
+The project includes `Dockerfile` and `railway.toml` for Railway deployment.
+
+Typical deploy flow:
 
 ```bash
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-streamlit run app.py
+git add .
+git commit -m "Update ridership reconciler V4.2"
+git push
 ```
 
-On macOS/Linux use `source .venv/bin/activate`.
+If the Railway service is linked to the GitHub repository, it should redeploy automatically.
 
-## Deploy on Railway
+## Streamlit
 
-V4 includes a `Dockerfile` and `railway.toml`.
+The app can still run on Streamlit Community Cloud for smaller tests. Railway is preferable when testing larger multi-day transaction files or when you want more control over CPU/RAM.
 
-1. Push the extracted project files to GitHub.
-2. In Railway, create a new project from the GitHub repo.
-3. Railway will build using the included Dockerfile.
-4. Generate a public domain for the service.
-5. For large report processing, use a paid Railway plan and set sensible per-replica CPU/RAM limits rather than relying on the smallest free allocation.
+## External AI review
 
-No API keys or secrets are required.
-
-## External AI workflow
-
-After reconciliation, download:
-
-- `ridership_ai_evidence_v4.json`
-- `ridership_ai_review_prompt_v4.md`
-
-Upload both to ChatGPT or another approved AI tool. The deterministic app remains the source of truth for arithmetic; the AI is asked only to interpret the evidence and propose next checks.
+No AI agent runs inside the app. The app exports a structured JSON evidence package and a review prompt that can be uploaded to an external AI for interpretation. The deterministic reconciliation engine remains the source of truth for arithmetic.

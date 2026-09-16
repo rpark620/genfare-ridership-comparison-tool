@@ -91,6 +91,7 @@ def _scan_legacy(path: str, targets: set[tuple[str, str]], chunksize: int = 100_
     headers = read_csv_header(path, skip_rows=header_row)
     cols = {
         "time": find_header_column(headers, ["Date Time", "DateTime", "Transaction Time"]),
+        "transaction_type": find_header_column(headers, ["Transaction Type", "Type"]),
         "product": find_header_column(headers, ["Product"]),
         "bus": find_header_column(headers, ["Bus"]),
         "driver": find_header_column(headers, ["Driver"]),
@@ -108,6 +109,9 @@ def _scan_legacy(path: str, targets: set[tuple[str, str]], chunksize: int = 100_
     for chunk in pd.read_csv(path, skiprows=header_row, usecols=usecols, dtype=str, chunksize=chunksize, low_memory=False):
         dates = _norm_date(chunk[cols["time"]])
         mask = dates.isin(target_dates)
+        if cols.get("transaction_type"):
+            tx = chunk[cols["transaction_type"]].astype(str)
+            mask = mask & tx.str.match(r"^(114|115|116|118|119)\s*-", na=False)
         if not mask.any():
             continue
         sub = chunk.loc[mask].copy()

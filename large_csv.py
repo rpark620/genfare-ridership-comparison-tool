@@ -30,6 +30,9 @@ class LargeCSVProfile:
     day_identifier: pd.DataFrame = field(default_factory=pd.DataFrame)
     day_route_identifier: pd.DataFrame = field(default_factory=pd.DataFrame)
     day_route_run_bus_identifier: pd.DataFrame = field(default_factory=pd.DataFrame)
+    boarding_day_identifier: pd.DataFrame = field(default_factory=pd.DataFrame)
+    boarding_day_route_identifier: pd.DataFrame = field(default_factory=pd.DataFrame)
+    boarding_day_route_run_bus_identifier: pd.DataFrame = field(default_factory=pd.DataFrame)
     transaction_signatures: pd.DataFrame = field(default_factory=pd.DataFrame)
     metadata: Dict[str, str] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
@@ -316,6 +319,27 @@ def profile_legacy_transaction_detail(path: str) -> LargeCSVProfile:
             SELECT date, route, run, bus, transaction_type, product, key_raw, ttp_raw, COUNT(*) event_count
             FROM src WHERE date <> '' GROUP BY ALL
         """).fetchdf()
+
+        # Candidate fare-use/boarding transactions. Administrative issuance events such as
+        # Issue card (142) and Transfer issued (128) are intentionally excluded.
+        boarding_day_raw = con.execute("""
+            SELECT date, transaction_type, product, key_raw, ttp_raw, COUNT(*) event_count
+            FROM src
+            WHERE date <> '' AND regexp_matches(transaction_type, '^(114|115|116|118|119)\\s*-')
+            GROUP BY ALL
+        """).fetchdf()
+        boarding_day_route_raw = con.execute("""
+            SELECT date, route, transaction_type, product, key_raw, ttp_raw, COUNT(*) event_count
+            FROM src
+            WHERE date <> '' AND regexp_matches(transaction_type, '^(114|115|116|118|119)\\s*-')
+            GROUP BY ALL
+        """).fetchdf()
+        boarding_day_detail_raw = con.execute("""
+            SELECT date, route, run, bus, transaction_type, product, key_raw, ttp_raw, COUNT(*) event_count
+            FROM src
+            WHERE date <> '' AND regexp_matches(transaction_type, '^(114|115|116|118|119)\\s*-')
+            GROUP BY ALL
+        """).fetchdf()
         sig_raw = pd.DataFrame()
     finally:
         con.close()
@@ -336,6 +360,9 @@ def profile_legacy_transaction_detail(path: str) -> LargeCSVProfile:
     day_identifier = _group_identifier(canon(day_raw), ["date"], False) if not day_raw.empty else pd.DataFrame(columns=["date", "identifier", "event_count"])
     day_route_identifier = _group_identifier(canon(day_route_raw), ["date", "route"], False) if not day_route_raw.empty else pd.DataFrame(columns=["date", "route", "identifier", "event_count"])
     day_route_run_bus_identifier = _group_identifier(canon(day_detail_raw), ["date", "route", "run", "bus"], False) if not day_detail_raw.empty else pd.DataFrame(columns=["date", "route", "run", "bus", "identifier", "event_count"])
+    boarding_day_identifier = _group_identifier(canon(boarding_day_raw), ["date"], False) if not boarding_day_raw.empty else pd.DataFrame(columns=["date", "identifier", "event_count"])
+    boarding_day_route_identifier = _group_identifier(canon(boarding_day_route_raw), ["date", "route"], False) if not boarding_day_route_raw.empty else pd.DataFrame(columns=["date", "route", "identifier", "event_count"])
+    boarding_day_route_run_bus_identifier = _group_identifier(canon(boarding_day_detail_raw), ["date", "route", "run", "bus"], False) if not boarding_day_detail_raw.empty else pd.DataFrame(columns=["date", "route", "run", "bus", "identifier", "event_count"])
     transaction_signatures = _group_identifier(canon(sig_raw), ["date", "timestamp", "bus", "driver", "route", "run", "trip"], False) if not sig_raw.empty else pd.DataFrame(columns=["date", "timestamp", "bus", "driver", "route", "run", "trip", "identifier", "event_count"])
 
     day_summary = pd.DataFrame(columns=["date", "event_count"])
@@ -353,6 +380,9 @@ def profile_legacy_transaction_detail(path: str) -> LargeCSVProfile:
         day_identifier=day_identifier,
         day_route_identifier=day_route_identifier,
         day_route_run_bus_identifier=day_route_run_bus_identifier,
+        boarding_day_identifier=boarding_day_identifier,
+        boarding_day_route_identifier=boarding_day_route_identifier,
+        boarding_day_route_run_bus_identifier=boarding_day_route_run_bus_identifier,
         transaction_signatures=transaction_signatures,
         metadata={"header_row": str(header_row + 1), "engine": "DuckDB streaming/aggregate scan"},
         confidence=100,

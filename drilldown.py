@@ -36,49 +36,79 @@ def _legacy_day_totals(routesum: LegacyRouteSum, legacy_tx: Optional[LargeCSVPro
         if not work.empty:
             out = work.groupby("date", as_index=False)["ridership"].sum().rename(columns={"ridership": "legacy_ridership"})
             out["legacy_source"] = "ROUTESUM by route-date"
+            out["legacy_daily_authoritative"] = True
             return out
-    if legacy_tx is not None and not legacy_tx.day_identifier.empty:
-        work = legacy_tx.day_identifier.copy()
-        work["counts_ridership"] = work["identifier"].map(rules)
-        work = work[work["counts_ridership"].eq(True)]
-        out = work.groupby("date", as_index=False)["event_count"].sum().rename(columns={"event_count": "legacy_ridership"})
-        out["legacy_source"] = "Derived from Legacy Transaction Detail + inferred ridership behavior"
-        return out
-    return pd.DataFrame(columns=["date", "legacy_ridership", "legacy_source"])
 
+    if legacy_tx is not None:
+        # Use only fare-use / boarding-candidate Legacy transactions. This deliberately
+        # excludes issuance/admin rows such as Issue card and Transfer issued, which can
+        # otherwise make a daily ridership reconstruction look much larger than it is.
+        work = getattr(legacy_tx, "boarding_day_route_identifier", pd.DataFrame()).copy()
+        if work.empty:
+            work = getattr(legacy_tx, "boarding_day_identifier", pd.DataFrame()).copy()
+        if not work.empty:
+            if "route" in work.columns:
+                # ROUTESUM used by this tool is normally filtered to Route > 0.
+                route_num = pd.to_numeric(work["route"], errors="coerce")
+                work = work[(route_num.isna()) | (route_num > 0)]
+            effective_rules = dict(rules)
+            effective_rules["PRESET"] = True
+            work["counts_ridership"] = work["identifier"].map(effective_rules)
+            work = work[work["counts_ridership"].eq(True)]
+            out = work.groupby("date", as_index=False)["event_count"].sum().rename(columns={"event_count": "legacy_ridership"})
+            out["legacy_source"] = "Derived from Legacy fare-use transactions + inferred ridership behavior"
+            out["legacy_daily_authoritative"] = False
+            return out
+    return pd.DataFrame(columns=["date", "legacy_ridership", "legacy_source", "legacy_daily_authoritative"])
 
 def build_day_comparison(gfl: LargeCSVProfile, routesum: LegacyRouteSum, legacy_tx: Optional[LargeCSVProfile], rules: dict[str, bool]) -> pd.DataFrame:
     legacy = _legacy_day_totals(routesum, legacy_tx, rules)
     if legacy.empty or gfl.day_summary.empty:
-        return pd.DataFrame(columns=["Date", "Legacy Ridership", "GFL Raw Ridership", "Raw Difference", "GFL Normalized Ridership", "Normalized Difference", "Legacy Source", "Status"])
+        return pd.DataFrame(columns=["Date", "Legacy Ridership", "Legacy Source", "Legacy Daily Authoritative", "GFL Raw Ridership", "GFL Normalized Ridership", "Raw Difference", "Normalized Difference", "Status"])
+
     raw = gfl.day_summary[["date", "ridership"]].rename(columns={"ridership": "gfl_raw_ridership"})
     if not gfl.day_identifier.empty:
         norm = gfl.day_identifier.copy()
-        norm["counts_ridership"] = norm["identifier"].map(rules)
+        effective_rules = dict(rules)
+        effective_rules["PRESET"] = True
+        norm["counts_ridership"] = norm["identifier"].map(effective_rules)
         norm["normalized"] = norm["ridership"]
         norm.loc[norm["counts_ridership"].eq(False), "normalized"] = 0.0
         norm = norm.groupby("date", as_index=False)["normalized"].sum().rename(columns={"normalized": "gfl_normalized_ridership"})
     else:
         norm = raw.rename(columns={"gfl_raw_ridership": "gfl_normalized_ridership"})
+
     out = legacy.merge(raw, on="date", how="outer").merge(norm, on="date", how="outer")
     for c in ["legacy_ridership", "gfl_raw_ridership", "gfl_normalized_ridership"]:
-        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0)
+        out[c] = pd.to_numeric(out[c], errors="coerce")
     out["legacy_source"] = out.get("legacy_source", "").fillna("No Legacy daily total available")
+    out["legacy_daily_authoritative"] = out.get("legacy_daily_authoritative", False).fillna(False).astype(bool)
+
+    # Only calculate a daily difference where a Legacy daily value actually exists.
     out["raw_difference"] = out["gfl_raw_ridership"] - out["legacy_ridership"]
     out["normalized_difference"] = out["gfl_normalized_ridership"] - out["legacy_ridership"]
-    out["status"] = np.where(out["normalized_difference"].abs() < 1e-9, "Reconciled after behavior normalization", np.where(out["raw_difference"].abs() < 1e-9, "Raw match", "Needs drill-down"))
+    out["status"] = np.select(
+        [
+            out["legacy_ridership"].isna(),
+            out["normalized_difference"].abs() < 1e-9,
+            out["raw_difference"].abs() < 1e-9,
+        ],
+        ["Legacy daily total unavailable", "Reconciled after behavior normalization", "Raw match"],
+        default="Needs drill-down",
+    )
     return out.rename(columns={
         "date": "Date", "legacy_ridership": "Legacy Ridership", "gfl_raw_ridership": "GFL Raw Ridership",
         "raw_difference": "Raw Difference", "gfl_normalized_ridership": "GFL Normalized Ridership",
-        "normalized_difference": "Normalized Difference", "legacy_source": "Legacy Source", "status": "Status",
+        "normalized_difference": "Normalized Difference", "legacy_source": "Legacy Source",
+        "legacy_daily_authoritative": "Legacy Daily Authoritative", "status": "Status",
     }).sort_values("Date").reset_index(drop=True)
-
 
 def build_day_identifier_comparison(gfl: LargeCSVProfile, legacy_tx: Optional[LargeCSVProfile], inference: RuleInference, rules: dict[str, bool]) -> pd.DataFrame:
     columns = ["Date", "Type", "Identifier", "Legacy Events", "GFL Ridership Records", "Record Difference", "Legacy Expected Riders", "GFL Riders", "Rider Difference", "Legacy Counts Ridership", "GFL Riders/Record", "Problem Summary", "Likely Cause", "Evidence"]
-    if legacy_tx is None or legacy_tx.day_identifier.empty or gfl.day_identifier.empty:
+    legacy_day = pd.DataFrame() if legacy_tx is None else getattr(legacy_tx, "boarding_day_identifier", pd.DataFrame())
+    if legacy_tx is None or legacy_day.empty or gfl.day_identifier.empty:
         return pd.DataFrame(columns=columns)
-    l = legacy_tx.day_identifier[["date", "identifier", "event_count"]].rename(columns={"event_count": "legacy_events"})
+    l = legacy_day[["date", "identifier", "event_count"]].rename(columns={"event_count": "legacy_events"})
     g = gfl.day_identifier[["date", "identifier", "event_count", "ridership"]].rename(columns={"event_count": "gfl_events", "ridership": "gfl_riders"})
     out = l.merge(g, on=["date", "identifier"], how="outer").fillna(0)
     display_mismatch = set()
@@ -117,7 +147,7 @@ def build_day_identifier_comparison(gfl: LargeCSVProfile, legacy_tx: Optional[La
         else:
             summary = "Ridership behavior matches"
             cause = "Match"
-        evidence = f"Legacy events={legacy_events:g}; GFL ridership-export records={gfl_events:g}; GFL riders={gfl_riders:g}."
+        evidence = f"Legacy fare-use events={legacy_events:g}; GFL ridership-export records={gfl_events:g}; GFL riders={gfl_riders:g}."
         if rule is not None:
             evidence += f" Inferred Legacy counts-ridership={bool(rule)}."
         rows.append({
@@ -132,19 +162,30 @@ def build_day_identifier_comparison(gfl: LargeCSVProfile, legacy_tx: Optional[La
     return result.sort_values(["Date", "_abs", "Type", "Identifier"], ascending=[True, False, True, True]).drop(columns="_abs").reset_index(drop=True)
 
 
-def _detail_merge(gfl: LargeCSVProfile, legacy_tx: Optional[LargeCSVProfile]) -> pd.DataFrame:
+def _detail_merge(gfl: LargeCSVProfile, legacy_tx: Optional[LargeCSVProfile], rules: dict[str, bool]) -> pd.DataFrame:
     columns = ["Date", "Route", "Run", "Bus", "Identifier", "Legacy Events", "GFL Ridership Records", "GFL Riders", "Record Difference"]
-    if legacy_tx is None or legacy_tx.day_route_run_bus_identifier.empty or gfl.day_route_run_bus_identifier.empty:
+    legacy_detail = pd.DataFrame() if legacy_tx is None else getattr(legacy_tx, "boarding_day_route_run_bus_identifier", pd.DataFrame())
+    if legacy_tx is None or legacy_detail.empty or gfl.day_route_run_bus_identifier.empty:
         return pd.DataFrame(columns=columns)
-    l = legacy_tx.day_route_run_bus_identifier.rename(columns={"date": "Date", "route": "Route", "run": "Run", "bus": "Bus", "identifier": "Identifier", "event_count": "Legacy Events"})
-    g = gfl.day_route_run_bus_identifier.rename(columns={"date": "Date", "route": "Route", "run": "Run", "bus": "Bus", "identifier": "Identifier", "event_count": "GFL Ridership Records", "ridership": "GFL Riders"})
+
+    effective_rules = dict(rules)
+    effective_rules["PRESET"] = True
+    l0 = legacy_detail.copy()
+    l0["counts_ridership"] = l0["identifier"].map(effective_rules)
+    l0 = l0[l0["counts_ridership"].eq(True)]
+
+    g0 = gfl.day_route_run_bus_identifier.copy()
+    g0["counts_ridership"] = g0["identifier"].map(effective_rules)
+    g0 = g0[g0["counts_ridership"].eq(True)]
+
+    l = l0.rename(columns={"date": "Date", "route": "Route", "run": "Run", "bus": "Bus", "identifier": "Identifier", "event_count": "Legacy Events"})
+    g = g0.rename(columns={"date": "Date", "route": "Route", "run": "Run", "bus": "Bus", "identifier": "Identifier", "event_count": "GFL Ridership Records", "ridership": "GFL Riders"})
     out = l[["Date", "Route", "Run", "Bus", "Identifier", "Legacy Events"]].merge(
         g[["Date", "Route", "Run", "Bus", "Identifier", "GFL Ridership Records", "GFL Riders"]],
         on=["Date", "Route", "Run", "Bus", "Identifier"], how="outer"
     ).fillna(0)
     out["Record Difference"] = out["GFL Ridership Records"] - out["Legacy Events"]
     return out[columns]
-
 
 def _aggregate_dimension(detail: pd.DataFrame, dims: list[str]) -> pd.DataFrame:
     if detail.empty:
@@ -200,8 +241,8 @@ def _pair_offsets(df: pd.DataFrame, context_cols: list[str], location_col: str, 
     return results
 
 
-def build_specific_comparisons(gfl: LargeCSVProfile, legacy_tx: Optional[LargeCSVProfile]):
-    detail = _detail_merge(gfl, legacy_tx)
+def build_specific_comparisons(gfl: LargeCSVProfile, legacy_tx: Optional[LargeCSVProfile], rules: dict[str, bool]):
+    detail = _detail_merge(gfl, legacy_tx, rules)
     if detail.empty:
         return {
             "route": pd.DataFrame(), "run": pd.DataFrame(), "bus": pd.DataFrame(),
@@ -223,7 +264,7 @@ def build_specific_comparisons(gfl: LargeCSVProfile, legacy_tx: Optional[LargeCS
 def build_drilldowns(gfl: LargeCSVProfile, routesum: LegacyRouteSum, legacy_tx: Optional[LargeCSVProfile], inference: RuleInference, rules: dict[str, bool]) -> dict:
     day = build_day_comparison(gfl, routesum, legacy_tx, rules)
     day_ident = build_day_identifier_comparison(gfl, legacy_tx, inference, rules)
-    specific = build_specific_comparisons(gfl, legacy_tx)
+    specific = build_specific_comparisons(gfl, legacy_tx, rules)
 
     targets = set()
     if not day_ident.empty:
@@ -253,10 +294,12 @@ def build_drilldowns(gfl: LargeCSVProfile, routesum: LegacyRouteSum, legacy_tx: 
     if transaction_error:
         notes.append(f"Targeted transaction matching could not complete: {transaction_error}")
     if not day.empty and "Legacy Source" in day.columns and day["Legacy Source"].str.contains("Derived", na=False).any():
-        derived_total = float(day["Legacy Ridership"].sum())
+        derived_total = float(pd.to_numeric(day["Legacy Ridership"], errors="coerce").fillna(0).sum())
         authoritative = float(routesum.totals.get("ridership", 0))
         if abs(derived_total - authoritative) > 1e-9:
-            notes.append(f"Daily Legacy ridership is derived from Transaction Detail and sums to {derived_total:g}, while authoritative ROUTESUM total is {authoritative:g}; use the daily drill-down directionally and inspect the residual.")
+            notes.append(f"Daily Legacy ridership reconstruction did not validate: derived fare-use riders sum to {derived_total:g}, while authoritative ROUTESUM total is {authoritative:g}. Daily values are shown as derived and should not be treated as authoritative raw Legacy totals.")
+        else:
+            notes.append("Daily Legacy ridership is reconstructed from fare-use transactions and validates exactly to the authoritative ROUTESUM total.")
 
     return {
         "day_comparison": day,
