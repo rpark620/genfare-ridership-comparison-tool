@@ -1,154 +1,187 @@
 from __future__ import annotations
 
-import io
-import re
+import os
+import time
 import pandas as pd
 import streamlit as st
 
-from parsers import (
-    parse_gfl_ridership,
-    parse_gfl_revenue,
-    parse_legacy_routesum,
-    parse_legacy_transaction_detail,
-)
-from reconciliation import reconcile
+from common import save_uploaded_file
 from exports import to_csv_bytes, to_excel_bytes
+from large_csv import profile_gfl_revenue, profile_gfl_ridership, profile_legacy_transaction_detail
+from legacy_routesum import parse_routesum
+from reconciliation import reconcile
 
-st.set_page_config(page_title="Genfare Report Reconciler", page_icon="🚌", layout="wide")
+st.set_page_config(page_title="Genfare Report Reconciler V2", page_icon="🚌", layout="wide")
 
-st.title("Genfare Report Reconciler")
-st.caption("Compare GenfareLink raw data against Legacy reports, drill down to keys/TTPs/routes/runs/trips, and flag likely causes of discrepancies.")
+st.title("Genfare Report Reconciler V2")
+st.caption("Large-file reconciliation for GenfareLink vs Legacy: ridership, revenue, keys/TTPs, routes, runs/trips, and likely causes — without manually entering ridership rules.")
 
-with st.expander("Preferred reports — read this first", expanded=True):
+with st.expander("Preferred reports — upload guidance", expanded=True):
     st.markdown("""
-**GenfareLink (GFL) — upload both CSVs**
+### Required
+**1. GenfareLink — Ridership Raw Data CSV**  
+This is the main GFL input. In the sample exports used to build V2, it contains `Ridership`, `Amount Charged`, `Key/TTP`, `Route`, `Run`, and `Trip`, so it is sufficient for both ridership and normal revenue comparison.
 
-1. **Ridership Raw Data CSV — required.** Preferred fields include `Ridership`, `Key/TTP`, `Route`, `Run`, `Trip`, and `Amount Charged`.
-2. **Revenue Raw Data CSV — required for full validation.** Preferred fields include `Revenue`, `Route`, `Run`, and `Trip`.
+**2. Legacy — EVENT SUMMARY (ROUTESUM)**  
+**PDF is preferred for V2** because the PDF preserves the Key Count, key-ridership display, and TTP headings needed for automatic ridership-rule inference. CSV is accepted for summary totals, but some Legacy CSV exports omit useful TTP/key labels.
 
-**Important:** In the sample GFL files used to build this tool, the Ridership Raw Data file *already contains* `Amount Charged`, and its total and route/run/trip revenue exactly matched the separate Revenue Raw Data file. The app still asks for **both** so the revenue export acts as an independent validation check and so future report/filter differences are caught.
+### Strongly recommended for full drill-down
+**3. Legacy — TRANSACTION DETAIL CSV**  
+Use CSV. This adds transaction-level evidence for route/run/trip mismatches and strengthens possible Data Edit / route reassignment explanations.
 
-**Legacy — CSV strongly preferred**
+### Optional
+**4. GenfareLink — Revenue Raw Data CSV**  
+Not required. V2 normally uses `Amount Charged` from the GFL Ridership Raw Data file. Upload Revenue Raw Data only when you want an independent GFL-vs-GFL revenue cross-check.
 
-1. **EVENT SUMMARY (ROUTESUM) — required.** CSV is preferred. `BY ROUTE` is best for route-level reconciliation; `BY ROUTE-DATE` is also accepted. PDF is accepted as a fallback, but detailed extraction is less reliable.
-2. **TRANSACTION DETAIL REPORT — strongly recommended.** CSV is preferred. This is what enables key/TTP, bus, route, run, trip, and likely Data Edit/reassignment analysis.
-
-Reports with no data are okay. The app will label them rather than silently treating an unreadable report as a valid zero.
+**No manual ridership-rule fields are used.** V2 infers Legacy behavior from the relationship between ROUTESUM route totals, presets, TTP counts, and key counts. It can also flag cases where the Legacy detailed key-ridership section appears to show 0 while overall/route ridership proves the key is actually contributing riders.
 """)
 
 st.subheader("1. Upload reports")
-c1, c2 = st.columns(2)
-with c1:
+left, right = st.columns(2)
+with left:
     st.markdown("#### GenfareLink")
-    gfl_rid_file = st.file_uploader("GFL Ridership Raw Data (.csv)", type=["csv"], key="gflrid")
-    gfl_rev_file = st.file_uploader("GFL Revenue Raw Data (.csv)", type=["csv"], key="gflrev")
-with c2:
+    gfl_rid_file = st.file_uploader("GFL Ridership Raw Data — required (.csv)", type=["csv"], key="gflrid")
+    gfl_rev_file = st.file_uploader("GFL Revenue Raw Data — optional (.csv)", type=["csv"], key="gflrev")
+with right:
     st.markdown("#### Legacy")
-    legacy_routesum_file = st.file_uploader("Legacy EVENT SUMMARY / ROUTESUM (.csv preferred, .pdf accepted)", type=["csv", "pdf"], key="routesum")
-    legacy_tx_file = st.file_uploader("Legacy TRANSACTION DETAIL (.csv strongly recommended)", type=["csv"], key="legacytx")
+    legacy_routesum_file = st.file_uploader("Legacy EVENT SUMMARY / ROUTESUM — required (.pdf preferred, .csv accepted)", type=["pdf", "csv"], key="routesum")
+    legacy_tx_file = st.file_uploader("Legacy TRANSACTION DETAIL — strongly recommended (.csv)", type=["csv"], key="legacytx")
 
-st.subheader("2. Ridership business rules")
-profile = st.selectbox("Agency profile", ["COLTS - current test rules", "Custom"], index=0)
-if profile == "COLTS - current test rules":
-    default_keys = "2, 3, 4"
-    default_ttps = "48"
-    st.caption("COLTS profile: Keys 2, 3, and 4 do not count as ridership. Keys 8 and D do count. TTP48/CHANGE does not count as ridership.")
-else:
-    default_keys = ""
-    default_ttps = ""
+with st.expander("How V2 determines ridership-rule differences"):
+    st.markdown("""
+V2 does **not** assume a list of keys/TTPs that should or should not count ridership. It attempts to reconstruct Legacy route ridership from:
 
-r1, r2 = st.columns(2)
-with r1:
-    nonrid_keys_text = st.text_input("Keys that should NOT count as ridership", value=default_keys, help="Comma-separated, e.g. 2, 3, 4")
-with r2:
-    nonrid_ttps_text = st.text_input("TTPs that should NOT count as ridership", value=default_ttps, help="Comma-separated, e.g. 48")
+`Preset + selected Key counts + selected TTP counts = Legacy route ridership`
 
-def parse_set(s):
-    return {x.strip().upper().replace("KEY", "").replace("TTP", "").strip() for x in re.split(r"[,;\s]+", s) if x.strip()}
+A binary optimization chooses the rider/non-rider behavior that best fits every Legacy route simultaneously. The detailed Legacy key-ridership page is used as evidence, but it is **not blindly trusted**. If that page says a key contributes 0 while the route and total ridership can only reconcile when that key counts, V2 flags the Legacy internal display inconsistency separately.
+""")
 
 run = st.button("Compare reports", type="primary", use_container_width=True)
 
 if run:
     missing = []
-    if not gfl_rid_file: missing.append("GFL Ridership Raw Data")
-    if not gfl_rev_file: missing.append("GFL Revenue Raw Data")
-    if not legacy_routesum_file: missing.append("Legacy ROUTESUM")
+    if not gfl_rid_file:
+        missing.append("GFL Ridership Raw Data")
+    if not legacy_routesum_file:
+        missing.append("Legacy ROUTESUM")
     if missing:
         st.error("Please upload: " + ", ".join(missing))
         st.stop()
 
+    temp_paths = []
     diagnostics = []
+    start = time.perf_counter()
     try:
-        with st.spinner("Recognizing and parsing reports..."):
-            gfl_rid = parse_gfl_ridership(gfl_rid_file)
-            gfl_rev = parse_gfl_revenue(gfl_rev_file)
-            legacy_routesum = parse_legacy_routesum(legacy_routesum_file, legacy_routesum_file.name)
-            legacy_tx = parse_legacy_transaction_detail(legacy_tx_file) if legacy_tx_file else None
+        with st.spinner("Scanning and aggregating reports with the large-file engine..."):
+            gfl_path = save_uploaded_file(gfl_rid_file); temp_paths.append(gfl_path)
+            gfl = profile_gfl_ridership(gfl_path)
 
-        for label, p in [
-            ("GFL Ridership", gfl_rid), ("GFL Revenue", gfl_rev), ("Legacy ROUTESUM", legacy_routesum),
-            ("Legacy Transaction Detail", legacy_tx),
+            routesum = parse_routesum(legacy_routesum_file, legacy_routesum_file.name)
+
+            legacy_tx = None
+            if legacy_tx_file:
+                ltx_path = save_uploaded_file(legacy_tx_file); temp_paths.append(ltx_path)
+                legacy_tx = profile_legacy_transaction_detail(ltx_path)
+
+            gfl_rev = None
+            if gfl_rev_file:
+                grev_path = save_uploaded_file(gfl_rev_file); temp_paths.append(grev_path)
+                gfl_rev = profile_gfl_revenue(grev_path)
+
+            result = reconcile(gfl, routesum, legacy_tx, gfl_rev)
+
+        elapsed = time.perf_counter() - start
+        for label, obj in [
+            ("GFL Ridership", gfl), ("Legacy ROUTESUM", routesum),
+            ("Legacy Transaction Detail", legacy_tx), ("GFL Revenue", gfl_rev),
         ]:
-            if p is None:
-                diagnostics.append({"Report": label, "Detected As": "Not uploaded", "Confidence": "—", "Warnings": "Key/TTP and run/trip cause analysis will be limited."})
+            if obj is None:
+                diagnostics.append({"Report": label, "Detected As": "Not uploaded", "Confidence": "—", "Warnings": "Optional/limited drill-down"})
             else:
-                diagnostics.append({"Report": label, "Detected As": p.kind, "Confidence": f"{p.confidence}%", "Warnings": " | ".join(p.warnings) if p.warnings else "None"})
+                diagnostics.append({
+                    "Report": label, "Detected As": obj.kind, "Confidence": f"{obj.confidence}%",
+                    "Warnings": " | ".join(getattr(obj, "warnings", []) or []) or "None"
+                })
         diagnostics_df = pd.DataFrame(diagnostics)
 
-        nonrid_keys = parse_set(nonrid_keys_text)
-        nonrid_ttps = parse_set(nonrid_ttps_text)
-        result = reconcile(gfl_rid, gfl_rev, legacy_routesum, legacy_tx,
-                           non_ridership_keys=nonrid_keys, non_ridership_ttps=nonrid_ttps)
-
-        st.success("Reports parsed and compared.")
+        st.success(f"Comparison completed in {elapsed:,.1f} seconds.")
         s = result["summary"]
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Legacy Ridership", f"{s['legacy_ridership']:,.0f}")
         m2.metric("GFL Raw Ridership", f"{s['gfl_raw_ridership']:,.0f}", delta=f"{s['gfl_raw_ridership']-s['legacy_ridership']:+,.0f} vs Legacy")
-        m3.metric("GFL Adjusted Ridership", f"{s['gfl_adjusted_ridership']:,.0f}", delta=f"{s['gfl_adjusted_ridership']-s['legacy_ridership']:+,.0f} vs Legacy")
+        m3.metric("GFL using inferred Legacy rules", f"{s['gfl_legacy_rule_normalized_ridership']:,.0f}", delta=f"{s['gfl_legacy_rule_normalized_ridership']-s['legacy_ridership']:+,.0f} vs Legacy")
         m4.metric("Revenue Difference", f"${s['gfl_revenue']-s['legacy_revenue']:+,.2f}")
 
-        rev_cross = s['gfl_revenue'] - s['gfl_ridership_amount_charged']
-        if abs(rev_cross) < 0.01:
-            st.info(f"GFL internal revenue cross-check: Revenue Raw Data and Ridership Raw Data `Amount Charged` match (${s['gfl_revenue']:,.2f}).")
-        else:
-            st.warning(f"GFL internal revenue cross-check differs by ${rev_cross:+,.2f}. Check report filters/date ranges before comparing to Legacy.")
+        st.caption(
+            f"Processed {s['gfl_rows']:,} GFL rows" +
+            (f" and {s['legacy_transaction_rows']:,} Legacy transaction rows" if s['legacy_transaction_rows'] else "") +
+            f". Rule inference confidence: {s['rule_confidence']}% ({'exact route fit' if s['rule_exact_fit'] else 'non-exact fit'})."
+        )
 
-        tabs = st.tabs(["All Findings", "Unresolved", "Keys", "TTPs", "Routes", "Possible Data Edits", "Run/Trip", "Diagnostics"])
-        f = result["findings"].copy()
+        if gfl_rev is None:
+            st.info("GFL Revenue Raw Data was not uploaded. Revenue comparison is using `Amount Charged` from the GFL Ridership Raw Data file, as intended in V2.")
+        else:
+            internal_diff = float(gfl_rev.totals.get("revenue", 0)) - s["gfl_amount_charged"]
+            if abs(internal_diff) < 0.01:
+                st.info("Optional GFL revenue cross-check passed: Revenue Raw Data matches Ridership Raw Data `Amount Charged`.")
+            else:
+                st.warning(f"Optional GFL revenue cross-check differs by ${internal_diff:+,.2f}. Check filters/date ranges.")
+
+        inf = result["rule_inference"]
+        if inf.warnings:
+            for warning in inf.warnings:
+                st.warning(warning)
+
+        tabs = st.tabs(["Unresolved", "All Findings", "Inferred Rules", "Legacy Internal", "Keys", "TTPs", "Routes", "Possible Data Edits", "Run/Trip", "Diagnostics"])
+        f = result["findings"]
         with tabs[0]:
-            st.dataframe(f, use_container_width=True, hide_index=True)
+            unresolved = f[(f["Status"] == "Unresolved") | (f["Severity"] == "Error")]
+            st.dataframe(unresolved, use_container_width=True, hide_index=True)
         with tabs[1]:
-            u = f[(f["Difference"].abs() > 1e-9) & (~f["Likely Cause"].isin(["Matched", "Matched total revenue", "Independent GFL exports reconcile"]))]
-            st.dataframe(u, use_container_width=True, hide_index=True)
+            st.dataframe(f, use_container_width=True, hide_index=True)
         with tabs[2]:
-            st.dataframe(f[f["Level"] == "Key"], use_container_width=True, hide_index=True)
+            if inf.rules.empty:
+                st.info("Automatic rule inference was unavailable for these report formats.")
+            else:
+                st.dataframe(inf.rules, use_container_width=True, hide_index=True)
         with tabs[3]:
-            st.dataframe(f[f["Level"] == "TTP"], use_container_width=True, hide_index=True)
+            st.dataframe(f[f["Level"] == "Legacy Internal"], use_container_width=True, hide_index=True)
+            if not inf.route_fit.empty:
+                st.markdown("**Route-level Legacy ridership reconstruction**")
+                st.dataframe(inf.route_fit, use_container_width=True, hide_index=True)
         with tabs[4]:
-            st.dataframe(f[f["Level"] == "Route"], use_container_width=True, hide_index=True)
+            st.dataframe(f[f["Level"] == "Key"], use_container_width=True, hide_index=True)
         with tabs[5]:
+            st.dataframe(f[f["Level"] == "TTP"], use_container_width=True, hide_index=True)
+        with tabs[6]:
+            st.dataframe(f[f["Level"] == "Route"], use_container_width=True, hide_index=True)
+        with tabs[7]:
             if result["route_reassignments"].empty:
-                st.info("No exact route-reassignment patterns were detected with the available transaction-level evidence.")
+                st.info("No exact route-offset patterns were detected.")
             else:
                 st.dataframe(result["route_reassignments"], use_container_width=True, hide_index=True)
-        with tabs[6]:
+        with tabs[8]:
             if legacy_tx is None:
-                st.info("Upload Legacy Transaction Detail CSV to enable run/trip analysis.")
+                st.info("Upload Legacy Transaction Detail CSV to enable run/trip-level derived comparison and stronger Data Edit evidence.")
             else:
                 rt = result["run_trip"]
                 st.dataframe(rt[rt["difference"].abs() > 1e-9] if not rt.empty else rt, use_container_width=True, hide_index=True)
-        with tabs[7]:
+        with tabs[9]:
             st.dataframe(diagnostics_df, use_container_width=True, hide_index=True)
-            st.caption("A low-confidence or warning result means the app recognized the report but recommends reviewing the source/filter assumptions.")
 
-        st.subheader("3. Download reconciliation")
+        st.subheader("2. Download reconciliation")
         d1, d2 = st.columns(2)
         with d1:
-            st.download_button("Download reconciliation CSV", data=to_csv_bytes(f), file_name="reconciliation_summary.csv", mime="text/csv", use_container_width=True)
+            st.download_button("Download reconciliation CSV", data=to_csv_bytes(f), file_name="reconciliation_summary_v2.csv", mime="text/csv", use_container_width=True)
         with d2:
-            st.download_button("Download full Excel workbook", data=to_excel_bytes(result, diagnostics_df), file_name="reconciliation_full.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+            st.download_button("Download full Excel workbook", data=to_excel_bytes(result, diagnostics_df), file_name="reconciliation_full_v2.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
 
-    except Exception as e:
-        st.exception(e)
-        st.info("If a report was exported in an unfamiliar layout, keep the file and use the Diagnostics/error text to add that layout as another recognized template.")
+    except Exception as exc:
+        st.exception(exc)
+        st.info("Keep the source report if this is a new layout. V2 is designed so additional Legacy/GFL templates can be added without changing the reconciliation engine.")
+    finally:
+        for path in temp_paths:
+            try:
+                os.remove(path)
+            except Exception:
+                pass

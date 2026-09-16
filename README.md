@@ -1,21 +1,29 @@
-# Genfare Report Reconciler
+# Genfare Report Reconciler V2
 
-Streamlit app for comparing GenfareLink raw ridership/revenue exports against Legacy Genfare reports.
+Streamlit tool for reconciling GenfareLink (GFL) raw data against Legacy Genfare reports.
 
-## Preferred reports
+## Preferred inputs
 
-### GenfareLink
-Upload **both**:
-1. Ridership Raw Data CSV
-2. Revenue Raw Data CSV
+### Required
+1. **GFL Ridership Raw Data CSV**
+2. **Legacy EVENT SUMMARY / ROUTESUM** — PDF preferred; CSV accepted
 
-The sample GFL ridership export contains `Amount Charged` and can reproduce the sample revenue total, but the app intentionally asks for the separate revenue export as an independent cross-check.
+### Strongly recommended
+3. **Legacy TRANSACTION DETAIL CSV** — enables run/trip drill-down and stronger route-reassignment evidence
 
-### Legacy
-1. **EVENT SUMMARY (ROUTESUM)** — CSV strongly preferred; PDF accepted as fallback.
-2. **TRANSACTION DETAIL REPORT** — CSV strongly recommended for Key/TTP and route/run/trip cause analysis.
+### Optional
+4. **GFL Revenue Raw Data CSV** — only an independent revenue cross-check. V2 normally uses `Amount Charged` in the GFL Ridership file.
 
-`BY ROUTE` is preferred when available. `BY ROUTE-DATE` is accepted for route/date totals.
+## Major V2 changes
+
+- No manual ridership-rule inputs.
+- Automatically infers which Legacy Key/TTP categories contribute ridership by fitting category counts to Legacy route ridership totals.
+- Detects Legacy internal display inconsistencies, such as a key showing zero on the detailed key-ridership page while overall/route totals require that key to contribute ridership.
+- Uses DuckDB aggregate scans for large CSVs instead of loading full transaction files into pandas.
+- Keeps large raw files on disk and brings only aggregate result tables into memory.
+- GFL Revenue Raw Data is optional.
+- Route/run/trip and likely Data Edit/reassignment diagnostics retained.
+- Upload limit configured to 1 GB per file for large datasets.
 
 ## Local run
 
@@ -26,31 +34,14 @@ streamlit run app.py
 
 ## Streamlit Community Cloud
 
-1. Create a GitHub repository.
-2. Upload all files from this folder, including `app.py`, `parsers.py`, `reconciliation.py`, `exports.py`, and `requirements.txt`.
-3. In Streamlit Community Cloud, choose **Create app** / **Deploy an app**.
-4. Select your repository and branch.
-5. Set the main file path to `app.py`.
-6. Deploy.
+Deploy the GitHub repository with `app.py` as the main file.
 
-No secrets or API keys are required for V1.
+No API keys or secrets are required.
 
-## Current V1 behavior
+## Large-file design
 
-- Auto-recognizes the supplied GFL ridership and revenue CSV structures.
-- Parses Legacy Transaction Detail CSV from its embedded header row.
-- Parses Legacy ROUTESUM CSV Revenue/Ridership sections even when title lines precede the table.
-- Accepts Legacy ROUTESUM PDF as a lower-confidence fallback for summary route/revenue/ridership parsing.
-- Applies editable ridership business rules.
-- Compares overall ridership/revenue, Key/TTP event counts, routes, and derived route/run/trip ridership.
-- Detects exact systemwide-matching Key/TTP route offsets as possible route reassignment / Data Edit patterns.
-- Produces reconciliation CSV and multi-tab Excel output.
-- Uses deterministic evidence-based confidence scores; no AI API is required.
+V2 saves uploads to temporary files and uses DuckDB to scan/group CSVs. This is substantially more memory-efficient than V1's full pandas load. Streamlit still receives the uploaded file itself, so practical limits depend on Streamlit hosting RAM, upload bandwidth, and file size. The code is designed for million-row-class comparisons and can spill DuckDB work to disk rather than retaining every raw transaction as a dataframe.
 
-## COLTS profile included
+## Important interpretation note
 
-- Keys 2, 3, 4: do **not** count as ridership.
-- Keys 8 and D: do count as ridership.
-- TTP48 / CHANGE: does **not** count as ridership.
-
-Use **Custom** for other agencies.
+Confidence percentages are evidence scores generated from deterministic matching/reconciliation logic. They are not AI-generated probabilities.

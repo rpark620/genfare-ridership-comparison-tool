@@ -1,289 +1,352 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Tuple
-import math
-import re
+from typing import Optional
 
+import numpy as np
 import pandas as pd
 
-from parsers import ParseResult
+from inference import RuleInference, infer_legacy_ridership_rules
+from large_csv import LargeCSVProfile
+from legacy_routesum import LegacyRouteSum
 
 
 FINDING_COLUMNS = [
-    "Severity", "Level", "Metric", "Identifier", "Legacy", "GFL", "Adjusted GFL",
-    "Difference", "Difference %", "Status", "Likely Cause", "Confidence %", "Evidence"
+    "Severity", "Level", "Metric", "Identifier", "Legacy", "GFL", "Difference", "Difference %",
+    "Status", "Likely Cause", "Confidence %", "Evidence"
 ]
 
 
-def _num(v):
-    try:
-        if pd.isna(v):
-            return 0.0
-        return float(v)
-    except Exception:
-        return 0.0
-
-
 def _pct(diff, legacy):
-    legacy = _num(legacy)
-    if abs(legacy) < 1e-12:
-        return None
-    return 100.0 * _num(diff) / abs(legacy)
+    if abs(float(legacy)) < 1e-12:
+        return np.nan
+    return float(diff) / float(legacy) * 100.0
 
 
-def _sev(diff, tol=1e-9):
-    return "Info" if abs(_num(diff)) <= tol else "Warning"
+def _severity(diff, explained=False):
+    if abs(float(diff)) < 1e-9:
+        return "Info"
+    return "Warning" if explained else "Error"
 
 
-def normalize_rule_set(values: Iterable[str]) -> set:
-    out = set()
-    for v in values:
-        s = str(v).strip().upper()
-        if not s:
-            continue
-        s = re.sub(r"^KEY\s*", "", s)
-        out.add(s)
-    return out
-
-
-def apply_gfl_rules(df: pd.DataFrame, non_ridership_keys: set, non_ridership_ttps: set) -> pd.DataFrame:
-    x = df.copy()
-    non_ridership_keys = normalize_rule_set(non_ridership_keys)
-    non_ridership_ttps = {str(v).strip().replace("TTP", "").strip() for v in non_ridership_ttps if str(v).strip()}
-    x["adjusted_ridership"] = pd.to_numeric(x["ridership"], errors="coerce").fillna(0)
-    if "key" in x:
-        x.loc[x["key"].astype(str).str.upper().isin(non_ridership_keys), "adjusted_ridership"] = 0
-    if "ttp" in x:
-        x.loc[x["ttp"].astype(str).isin(non_ridership_ttps), "adjusted_ridership"] = 0
-    return x
-
-
-def apply_legacy_rules(df: pd.DataFrame, non_ridership_keys: set, non_ridership_ttps: set) -> pd.DataFrame:
-    x = df.copy()
-    non_ridership_keys = normalize_rule_set(non_ridership_keys)
-    non_ridership_ttps = {str(v).strip().replace("TTP", "").strip() for v in non_ridership_ttps if str(v).strip()}
-    x["expected_ridership"] = 0.0
-    if "is_fare_event" in x:
-        x.loc[x["is_fare_event"], "expected_ridership"] = 1.0
-    if "key" in x:
-        x.loc[x["key"].astype(str).str.upper().isin(non_ridership_keys), "expected_ridership"] = 0
-    if "ttp" in x:
-        x.loc[x["ttp"].astype(str).isin(non_ridership_ttps), "expected_ridership"] = 0
-    return x
-
-
-def add_finding(rows: List[dict], *, severity="Warning", level, metric, identifier, legacy, gfl,
-                adjusted_gfl=None, status="Difference", cause="Unexplained discrepancy",
-                confidence=60, evidence=""):
-    compare_val = gfl if adjusted_gfl is None else adjusted_gfl
-    diff = _num(compare_val) - _num(legacy)
+def add_finding(rows, *, level, metric, identifier, legacy, gfl, cause, confidence, evidence,
+                status=None, severity=None):
+    legacy = float(legacy) if legacy is not None and not pd.isna(legacy) else 0.0
+    gfl = float(gfl) if gfl is not None and not pd.isna(gfl) else 0.0
+    diff = gfl - legacy
+    explained = any(x in cause.lower() for x in ["rule", "reassignment", "data edit", "matched", "reconcile", "display"])
     rows.append({
-        "Severity": severity if abs(diff) > 1e-9 else "Info",
+        "Severity": severity or _severity(diff, explained),
         "Level": level,
         "Metric": metric,
         "Identifier": identifier,
         "Legacy": legacy,
         "GFL": gfl,
-        "Adjusted GFL": adjusted_gfl if adjusted_gfl is not None else gfl,
         "Difference": diff,
         "Difference %": _pct(diff, legacy),
-        "Status": status if abs(diff) > 1e-9 else "Match",
-        "Likely Cause": cause if abs(diff) > 1e-9 else "Matched",
-        "Confidence %": confidence,
+        "Status": status or ("Match" if abs(diff) < 1e-9 else ("Explained" if explained else "Unresolved")),
+        "Likely Cause": cause,
+        "Confidence %": int(confidence),
         "Evidence": evidence,
     })
 
 
-def group_identifier(df: pd.DataFrame, id_prefix: str, value_col: str) -> pd.DataFrame:
-    x = df[df["identifier"].astype(str).str.startswith(id_prefix)].copy()
-    if x.empty:
-        return pd.DataFrame(columns=["identifier", value_col])
-    return x.groupby("identifier", dropna=False)[value_col].sum().reset_index()
+def _legacy_category_counts(routesum: LegacyRouteSum, legacy_tx: Optional[LargeCSVProfile]) -> pd.DataFrame:
+    frames = []
+    have_keys = not routesum.key_counts.empty
+    have_ttps = not routesum.ttp_counts.empty
+    if have_keys:
+        frames.append(routesum.key_counts.rename(columns={"count": "legacy_count"}))
+    if have_ttps:
+        frames.append(routesum.ttp_counts.rename(columns={"count": "legacy_count"}))
+    if legacy_tx is not None and not legacy_tx.route_identifier.empty and (not have_keys or not have_ttps):
+        tx = legacy_tx.route_identifier.rename(columns={"event_count": "legacy_count"})
+        if not have_keys:
+            frames.append(tx[tx["identifier"].str.startswith("KEY ", na=False)][["route", "identifier", "legacy_count"]])
+        if not have_ttps:
+            frames.append(tx[tx["identifier"].str.startswith("TTP ", na=False)][["route", "identifier", "legacy_count"]])
+    if not routesum.route_summary.empty and "preset" in routesum.route_summary.columns:
+        p = routesum.route_summary[["route", "preset"]].rename(columns={"preset": "legacy_count"}).copy()
+        p["identifier"] = "PRESET"
+        frames.append(p[["route", "identifier", "legacy_count"]])
+    if frames:
+        frames = [x for x in frames if x is not None and not x.empty]
+        if frames:
+            return pd.concat(frames, ignore_index=True).groupby(["route", "identifier"], as_index=False)["legacy_count"].sum()
+    return pd.DataFrame(columns=["route", "identifier", "legacy_count"])
 
 
-def event_counts(df: pd.DataFrame, id_prefix: str) -> pd.DataFrame:
-    x = df[df["identifier"].astype(str).str.startswith(id_prefix)].copy()
-    if x.empty:
-        return pd.DataFrame(columns=["identifier", "event_count"])
-    return x.groupby("identifier").size().rename("event_count").reset_index()
+def _rule_map(inference: RuleInference) -> dict[str, bool]:
+    if inference.rules.empty:
+        return {}
+    return dict(zip(inference.rules["identifier"], inference.rules["inferred_counts_ridership"].astype(bool)))
 
 
-def _outer_counts(legacy_df, gfl_df, prefix):
-    lc = event_counts(legacy_df, prefix).rename(columns={"event_count": "legacy_count"})
-    gc = event_counts(gfl_df, prefix).rename(columns={"event_count": "gfl_count"})
-    c = lc.merge(gc, on="identifier", how="outer").fillna(0)
-    if not c.empty:
-        c["legacy_count"] = c["legacy_count"].astype(float)
-        c["gfl_count"] = c["gfl_count"].astype(float)
-    return c
+def _normalize_gfl_ridership(gfl: LargeCSVProfile, rule_map: dict[str, bool]):
+    ident = gfl.identifier_summary.copy()
+    if ident.empty:
+        return float(gfl.totals.get("ridership", 0)), pd.DataFrame()
+    ident["legacy_rule"] = ident["identifier"].map(rule_map)
+    ident["normalized_ridership"] = ident["ridership"]
+    mask = ident["legacy_rule"].eq(False)
+    ident.loc[mask, "normalized_ridership"] = 0.0
+    raw = float(gfl.totals.get("ridership", 0))
+    removed = float((ident["ridership"] - ident["normalized_ridership"]).sum())
+    return raw - removed, ident
 
 
-def detect_route_reassignments(legacy_tx: pd.DataFrame, gfl: pd.DataFrame) -> pd.DataFrame:
-    """Find exact positive/negative route offsets for the same KEY/TTP with matching system totals."""
-    rows = []
-    if legacy_tx is None or legacy_tx.empty:
-        return pd.DataFrame()
-    for prefix in ["KEY ", "TTP "]:
-        ids = sorted(set(legacy_tx.loc[legacy_tx.identifier.str.startswith(prefix, na=False), "identifier"]) |
-                     set(gfl.loc[gfl.identifier.str.startswith(prefix, na=False), "identifier"]))
-        for ident in ids:
-            l = legacy_tx[legacy_tx.identifier == ident].groupby("route").size().astype(float)
-            g = gfl[gfl.identifier == ident].groupby("route").size().astype(float)
-            if abs(l.sum() - g.sum()) > 1e-9:
-                continue
-            comp = pd.concat([l.rename("legacy"), g.rename("gfl")], axis=1).fillna(0)
-            comp["delta"] = comp["gfl"] - comp["legacy"]
-            pos = [[idx, float(v)] for idx, v in comp.loc[comp.delta > 0, "delta"].items()]
-            neg = [[idx, float(-v)] for idx, v in comp.loc[comp.delta < 0, "delta"].items()]
-            for p in pos:
-                remain = p[1]
-                for n in neg:
-                    if remain <= 0 or n[1] <= 0:
-                        continue
-                    moved = min(remain, n[1])
-                    if moved <= 0:
-                        continue
-                    confidence = 96 if moved == p[1] or moved == n[1] else 90
-                    rows.append({
-                        "identifier": ident,
-                        "from_legacy_route": str(n[0]),
-                        "to_gfl_route": str(p[0]),
-                        "count": moved,
-                        "confidence": confidence,
-                        "evidence": f"Systemwide {ident} count matches; GFL route {p[0]} is +{moved:g} while legacy route {n[0]} is -{moved:g}."
-                    })
-                    remain -= moved
-                    n[1] -= moved
-    return pd.DataFrame(rows)
+def _normalized_route_gfl(gfl: LargeCSVProfile, rule_map: dict[str, bool]) -> pd.DataFrame:
+    d = gfl.route_identifier.copy()
+    if d.empty:
+        return pd.DataFrame(columns=["route", "gfl_raw_ridership", "gfl_normalized_ridership"])
+    d["legacy_rule"] = d["identifier"].map(rule_map)
+    d["normalized"] = d["ridership"]
+    d.loc[d["legacy_rule"].eq(False), "normalized"] = 0.0
+    return d.groupby("route", as_index=False).agg(
+        gfl_raw_ridership=("ridership", "sum"), gfl_normalized_ridership=("normalized", "sum")
+    )
 
 
-def reconcile(gfl_rid: ParseResult, gfl_rev: ParseResult, legacy_routesum: ParseResult,
-              legacy_tx: Optional[ParseResult], *, non_ridership_keys: set, non_ridership_ttps: set):
-    findings: List[dict] = []
-    gfl = apply_gfl_rules(gfl_rid.data, non_ridership_keys, non_ridership_ttps)
-    ltx = apply_legacy_rules(legacy_tx.data, non_ridership_keys, non_ridership_ttps) if legacy_tx and not legacy_tx.data.empty else pd.DataFrame()
+def detect_route_reassignments(routesum: LegacyRouteSum, gfl: LargeCSVProfile, legacy_tx: Optional[LargeCSVProfile]) -> pd.DataFrame:
+    legacy = _legacy_category_counts(routesum, legacy_tx)
+    if legacy.empty or gfl.route_identifier.empty:
+        return pd.DataFrame(columns=["identifier", "legacy_route", "gfl_route", "count", "confidence", "evidence"])
+    g = gfl.route_identifier[["route", "identifier", "event_count"]].rename(columns={"event_count": "gfl_count"})
+    c = legacy.merge(g, on=["route", "identifier"], how="outer").fillna(0)
+    c["difference"] = c["gfl_count"] - c["legacy_count"]
+    results = []
+    for ident, group in c.groupby("identifier"):
+        sys_legacy = float(group["legacy_count"].sum())
+        sys_gfl = float(group["gfl_count"].sum())
+        if abs(sys_legacy - sys_gfl) > 1e-9:
+            continue
+        positives = [[str(r.route), float(r.difference)] for _, r in group[group.difference > 0].iterrows()]
+        negatives = [[str(r.route), float(-r.difference)] for _, r in group[group.difference < 0].iterrows()]
+        pi = ni = 0
+        while pi < len(positives) and ni < len(negatives):
+            pr, pv = positives[pi]
+            nr, nv = negatives[ni]
+            amount = min(pv, nv)
+            if amount > 0:
+                confidence = 90
+                evidence = f"Systemwide {ident} count matches ({sys_gfl:g}). GFL Route {pr} is +{amount:g} while Legacy Route {nr} is +{amount:g} relative to GFL."
+                # Stronger evidence if the same route/run/trip/identifier groups appear in transaction detail.
+                if legacy_tx is not None and not legacy_tx.route_run_trip_identifier.empty and not gfl.route_run_trip_identifier.empty:
+                    l = legacy_tx.route_run_trip_identifier
+                    gg = gfl.route_run_trip_identifier
+                    la = l[(l.identifier == ident) & (l.route.astype(str) == nr)].groupby(["run", "trip"])["event_count"].sum()
+                    ga = gg[(gg.identifier == ident) & (gg.route.astype(str) == pr)].groupby(["run", "trip"])["event_count"].sum()
+                    common = la.to_frame("legacy").join(ga.to_frame("gfl"), how="inner")
+                    matching = float(common[["legacy", "gfl"]].min(axis=1).sum()) if not common.empty else 0.0
+                    if matching >= amount * 0.8:
+                        confidence = 98
+                        evidence += f" Matching run/trip evidence accounts for approximately {matching:g} events."
+                results.append({
+                    "identifier": ident, "legacy_route": nr, "gfl_route": pr,
+                    "count": amount, "confidence": confidence, "evidence": evidence,
+                })
+            positives[pi][1] -= amount
+            negatives[ni][1] -= amount
+            if positives[pi][1] <= 1e-9:
+                pi += 1
+            if negatives[ni][1] <= 1e-9:
+                ni += 1
+    return pd.DataFrame(results)
 
-    legacy_riders = _num(legacy_routesum.totals.get("ridership", 0))
-    legacy_rev = _num(legacy_routesum.totals.get("total_revenue", legacy_routesum.totals.get("current_revenue", 0)))
-    raw_gfl_riders = float(gfl["ridership"].sum())
-    adj_gfl_riders = float(gfl["adjusted_ridership"].sum())
-    gfl_revenue = _num(gfl_rev.totals.get("revenue", 0))
-    gfl_amount = _num(gfl_rid.totals.get("amount_charged", 0))
 
-    removed = raw_gfl_riders - adj_gfl_riders
-    overall_cause = "Business-rule adjustment explains raw GFL ridership difference" if abs(adj_gfl_riders - legacy_riders) < 1e-9 and abs(raw_gfl_riders-legacy_riders) > 1e-9 else "Unexplained overall ridership difference"
-    overall_conf = 100 if abs(adj_gfl_riders - legacy_riders) < 1e-9 else 70
-    add_finding(findings, level="Overall", metric="Ridership", identifier="Total Ridership",
-                legacy=legacy_riders, gfl=raw_gfl_riders, adjusted_gfl=adj_gfl_riders,
-                cause=overall_cause, confidence=overall_conf,
-                evidence=f"Raw GFL={raw_gfl_riders:g}; rules removed {removed:g}; adjusted GFL={adj_gfl_riders:g}.")
+def reconcile(gfl: LargeCSVProfile, routesum: LegacyRouteSum,
+              legacy_tx: Optional[LargeCSVProfile] = None,
+              gfl_revenue: Optional[LargeCSVProfile] = None) -> dict:
+    findings = []
+    inference = infer_legacy_ridership_rules(routesum, legacy_tx)
+    rules = _rule_map(inference)
 
-    rev_cause = "Matched total revenue" if abs(gfl_revenue-legacy_rev) < 0.01 else "Revenue total mismatch"
-    add_finding(findings, level="Overall", metric="Revenue", identifier="Total Revenue",
-                legacy=legacy_rev, gfl=gfl_revenue, adjusted_gfl=gfl_revenue,
-                cause=rev_cause, confidence=100 if abs(gfl_revenue-legacy_rev)<0.01 else 75,
-                evidence=f"Legacy total uses Current Revenue + Unclassified Revenue where available.")
+    legacy_riders = float(routesum.totals.get("ridership", 0))
+    raw_gfl = float(gfl.totals.get("ridership", 0))
+    normalized_gfl, gfl_ident = _normalize_gfl_ridership(gfl, rules)
+    removed = raw_gfl - normalized_gfl
 
-    # GFL independent revenue cross-check against Amount Charged contained in ridership raw export.
-    add_finding(findings, level="Validation", metric="Revenue", identifier="GFL Revenue File vs Ridership Amount Charged",
-                legacy=gfl_amount, gfl=gfl_revenue, adjusted_gfl=gfl_revenue,
-                cause="Independent GFL exports reconcile" if abs(gfl_amount-gfl_revenue)<0.01 else "GFL exports disagree",
-                confidence=100, evidence="Compares GFL ridership raw Amount Charged sum to GFL revenue raw Revenue sum.")
+    add_finding(
+        findings, level="Overall", metric="Ridership", identifier="Raw total ridership",
+        legacy=legacy_riders, gfl=raw_gfl,
+        cause="Raw ridership difference" if abs(raw_gfl - legacy_riders) > 1e-9 else "Matched raw ridership",
+        confidence=100, evidence="Legacy total comes from ROUTESUM; GFL total is the sum of the Ridership column."
+    )
+    if rules:
+        cause = "Ridership-rule differences fully explain total" if abs(normalized_gfl - legacy_riders) < 1e-9 else "Rule normalization explains part of total difference"
+        add_finding(
+            findings, level="Overall", metric="Ridership", identifier="GFL normalized to inferred Legacy rules",
+            legacy=legacy_riders, gfl=normalized_gfl, cause=cause,
+            confidence=inference.confidence,
+            evidence=f"Automatic Legacy rule inference removed {removed:g} GFL riders; no manual ridership rules were supplied."
+        )
 
-    # Key / TTP count comparisons from transaction detail when available.
-    if not ltx.empty:
-        for prefix, level in [("KEY ", "Key"), ("TTP ", "TTP")]:
-            comp = _outer_counts(ltx, gfl, prefix)
-            for _, r in comp.iterrows():
-                ident = r["identifier"]
-                lc, gc = float(r["legacy_count"]), float(r["gfl_count"])
-                if prefix == "KEY ":
-                    key = ident.replace("KEY ", "")
-                    expected_legacy_rid = 0 if key.upper() in normalize_rule_set(non_ridership_keys) else lc
-                    gfl_rows = gfl[gfl.identifier == ident]
-                    raw_rid = float(gfl_rows.ridership.sum())
-                    adj_rid = float(gfl_rows.adjusted_ridership.sum())
-                    if abs(gc-lc)<1e-9 and abs(raw_rid-expected_legacy_rid)>1e-9 and abs(adj_rid-expected_legacy_rid)<1e-9:
-                        cause = "Ridership configuration/business rule"
-                        conf = 99
-                        ev = f"Event counts match ({gc:g}); raw GFL ridership={raw_rid:g}; rule-adjusted ridership={adj_rid:g}."
-                    elif abs(gc-lc)<1e-9:
-                        cause = "Matched key event count"
-                        conf = 100
-                        ev = f"Legacy and GFL both contain {gc:g} events."
-                    else:
-                        cause = "Key event-count mismatch"
-                        conf = 80
-                        ev = f"Legacy events={lc:g}; GFL events={gc:g}."
-                    add_finding(findings, level="Key", metric="Event Count", identifier=ident,
-                                legacy=lc, gfl=gc, adjusted_gfl=gc, cause=cause, confidence=conf, evidence=ev)
-                else:
-                    cause = "Matched TTP event count" if abs(gc-lc)<1e-9 else "TTP event-count mismatch"
-                    add_finding(findings, level="TTP", metric="Event Count", identifier=ident,
-                                legacy=lc, gfl=gc, adjusted_gfl=gc, cause=cause,
-                                confidence=100 if abs(gc-lc)<1e-9 else 80,
-                                evidence=f"Legacy events={lc:g}; GFL events={gc:g}.")
+    legacy_revenue = float(routesum.totals.get("total_revenue", 0))
+    gfl_amount = float(gfl.totals.get("amount_charged", 0))
+    gfl_rev_total = float(gfl_revenue.totals.get("revenue", 0)) if gfl_revenue is not None else gfl_amount
+    add_finding(
+        findings, level="Overall", metric="Revenue", identifier="Total revenue",
+        legacy=legacy_revenue, gfl=gfl_rev_total,
+        cause="Matched total revenue" if abs(gfl_rev_total - legacy_revenue) < 0.01 else "Revenue total mismatch",
+        confidence=100 if abs(gfl_rev_total - legacy_revenue) < 0.01 else 80,
+        evidence="GFL uses optional Revenue Raw Data when supplied; otherwise it uses Amount Charged from the Ridership Raw Data export. Legacy uses Current + Unclassified Revenue."
+    )
+    if gfl_revenue is not None:
+        add_finding(
+            findings, level="Validation", metric="Revenue", identifier="GFL Revenue file vs Ridership Amount Charged",
+            legacy=gfl_amount, gfl=float(gfl_revenue.totals.get("revenue", 0)),
+            cause="Independent GFL exports reconcile" if abs(float(gfl_revenue.totals.get("revenue", 0)) - gfl_amount) < 0.01 else "GFL exports disagree",
+            confidence=100,
+            evidence="Optional cross-check only; the Revenue Raw Data file is not required."
+        )
 
-    # Route ridership authoritative comparison (ROUTESUM vs adjusted GFL)
-    if not legacy_routesum.data.empty:
-        lr = legacy_routesum.data.groupby("route", dropna=False).agg(legacy_ridership=("ridership", "sum"), legacy_revenue=("current_revenue", "sum"), legacy_unclass=("unclassified_revenue", "sum")).reset_index()
-        gr = gfl.groupby("route", dropna=False)["adjusted_ridership"].sum().rename("gfl_ridership").reset_index()
-        rr = gfl_rev.data.groupby("route", dropna=False)["revenue"].sum().rename("gfl_revenue").reset_index()
-        rc = lr.merge(gr, on="route", how="outer").merge(rr, on="route", how="outer").fillna(0)
-        rc["legacy_total_revenue"] = rc["legacy_revenue"] + rc["legacy_unclass"]
+    # Legacy internal fit and hidden ridership contributions.
+    if not inference.route_fit.empty:
+        residual = float(inference.route_fit["residual"].abs().sum())
+        add_finding(
+            findings, level="Legacy Internal", metric="Ridership Reconstruction", identifier="ROUTESUM category reconstruction",
+            legacy=legacy_riders, gfl=legacy_riders - residual,
+            cause="Legacy category counts reconcile to overall/route ridership" if inference.exact_fit else "Legacy category tables do not fully reconstruct ridership",
+            confidence=inference.confidence,
+            evidence=f"Rules inferred from {inference.source}. Absolute route-level reconstruction residual: {residual:g}."
+        )
+
+    legacy_counts = _legacy_category_counts(routesum, legacy_tx)
+    legacy_ident_totals = legacy_counts.groupby("identifier")["legacy_count"].sum() if not legacy_counts.empty else pd.Series(dtype=float)
+    gfl_totals = gfl.identifier_summary.set_index("identifier") if not gfl.identifier_summary.empty else pd.DataFrame()
+    rule_table = inference.rules.set_index("identifier") if not inference.rules.empty else pd.DataFrame()
+    identifiers = sorted(set(legacy_ident_totals.index.tolist()) | set(gfl.identifier_summary.get("identifier", pd.Series(dtype=str)).tolist()))
+    for ident in identifiers:
+        if not (ident.startswith("KEY ") or ident.startswith("TTP ") or ident == "PRESET"):
+            continue
+        lc = float(legacy_ident_totals.get(ident, 0))
+        if not gfl_totals.empty and ident in gfl_totals.index:
+            row = gfl_totals.loc[ident]
+            if isinstance(row, pd.DataFrame):
+                gc = float(row["event_count"].sum()); grid = float(row["ridership"].sum())
+            else:
+                gc = float(row.get("event_count", 0)); grid = float(row.get("ridership", 0))
+        else:
+            gc = grid = 0.0
+        if abs(gc - lc) < 1e-9:
+            cause = "Matched event count"
+            conf = 100
+        else:
+            cause = "Event-count discrepancy"
+            conf = 85
+        add_finding(findings, level="Key" if ident.startswith("KEY ") else ("TTP" if ident.startswith("TTP ") else "Preset"),
+                    metric="Event Count", identifier=ident, legacy=lc, gfl=gc, cause=cause, confidence=conf,
+                    evidence=f"Legacy count={lc:g}; GFL raw-event count={gc:g}.")
+
+        if not rule_table.empty and ident in rule_table.index and gc > 0:
+            rr = rule_table.loc[ident]
+            legacy_rate = 1.0 if bool(rr["inferred_counts_ridership"]) else 0.0
+            gfl_rate = grid / gc if gc else 0.0
+            if abs(gfl_rate - legacy_rate) < 1e-9:
+                cause = "Matched ridership behavior"
+                conf = inference.confidence
+            else:
+                cause = "Ridership-rule difference between GFL and Legacy"
+                conf = min(99, inference.confidence)
+            add_finding(findings, level="Key" if ident.startswith("KEY ") else "TTP",
+                        metric="Ridership Rate", identifier=ident, legacy=legacy_rate, gfl=gfl_rate,
+                        cause=cause, confidence=conf,
+                        evidence=f"Legacy rule is inferred from route/overall totals; GFL contributed {grid:g} riders across {gc:g} events.")
+
+    if not inference.rules.empty:
+        hidden = inference.rules[inference.rules["legacy_display_mismatch"] == True]
+        for _, r in hidden.iterrows():
+            ident = r["identifier"]
+            displayed = float(r["legacy_displayed_key_ridership"])
+            inferred = float(r["inferred_legacy_ridership"])
+            add_finding(
+                findings, level="Legacy Internal", metric="Key Ridership Display", identifier=ident,
+                legacy=displayed, gfl=inferred,
+                cause="Legacy detailed key-ridership section does not reflect contribution required by overall/route totals",
+                confidence=inference.confidence,
+                evidence=f"Legacy key presses={r['legacy_event_count']:g}; detailed key-ridership page shows {displayed:g}, but route/overall totals require {inferred:g}."
+            )
+
+    # Route comparison after applying automatically inferred Legacy rules to GFL.
+    norm_route = _normalized_route_gfl(gfl, rules)
+    if not routesum.route_summary.empty:
+        lr = routesum.route_summary[["route", "ridership", "current_revenue", "unclassified_revenue"]].copy()
+        lr["legacy_revenue"] = lr["current_revenue"] + lr["unclassified_revenue"]
+        rc = lr.merge(norm_route, on="route", how="outer").fillna(0)
+        gfl_route_rev = (gfl_revenue.route_revenue if gfl_revenue is not None else gfl.route_revenue).rename(columns={"revenue": "gfl_revenue"})
+        rc = rc.merge(gfl_route_rev, on="route", how="outer").fillna(0)
         for _, r in rc.iterrows():
-            route = str(r["route"])
-            ld, gd = float(r["legacy_ridership"]), float(r["gfl_ridership"])
-            cause = "Matched route ridership" if abs(gd-ld)<1e-9 else "Route allocation difference or missing/extra transactions"
-            conf = 100 if abs(gd-ld)<1e-9 else 65
-            add_finding(findings, level="Route", metric="Ridership", identifier=f"Route {route}", legacy=ld, gfl=gd, adjusted_gfl=gd, cause=cause, confidence=conf,
-                        evidence="Legacy route total comes from ROUTESUM; GFL route total uses rule-adjusted ridership.")
-            lrev, grev = float(r["legacy_total_revenue"]), float(r["gfl_revenue"])
-            add_finding(findings, level="Route", metric="Revenue", identifier=f"Route {route}", legacy=lrev, gfl=grev, adjusted_gfl=grev,
-                        cause="Matched route revenue" if abs(grev-lrev)<0.01 else "Route revenue allocation difference",
-                        confidence=100 if abs(grev-lrev)<0.01 else 70,
-                        evidence="Legacy route revenue = current + unclassified; GFL from revenue raw export.")
+            ld, gd = float(r["ridership"]), float(r["gfl_normalized_ridership"])
+            add_finding(
+                findings, level="Route", metric="Ridership", identifier=f"Route {r['route']}", legacy=ld, gfl=gd,
+                cause="Matched route ridership" if abs(gd-ld)<1e-9 else "Route allocation difference, Data Edit, or missing/extra transactions",
+                confidence=100 if abs(gd-ld)<1e-9 else 72,
+                evidence="GFL route ridership is normalized using automatically inferred Legacy ridership behavior."
+            )
+            add_finding(
+                findings, level="Route", metric="Revenue", identifier=f"Route {r['route']}", legacy=float(r["legacy_revenue"]), gfl=float(r["gfl_revenue"]),
+                cause="Matched route revenue" if abs(float(r["gfl_revenue"])-float(r["legacy_revenue"]))<0.01 else "Route revenue allocation difference",
+                confidence=100 if abs(float(r["gfl_revenue"])-float(r["legacy_revenue"]))<0.01 else 75,
+                evidence="Legacy route revenue = Current + Unclassified Revenue."
+            )
 
-    reassign = detect_route_reassignments(ltx, gfl) if not ltx.empty else pd.DataFrame()
-    if not reassign.empty:
-        for _, r in reassign.iterrows():
-            add_finding(findings, level="Route/Product", metric="Event Count", identifier=f"{r['identifier']}: Legacy Route {r['from_legacy_route']} → GFL Route {r['to_gfl_route']}",
-                        legacy=r["count"], gfl=r["count"], adjusted_gfl=r["count"], status="Explained",
-                        cause="Possible route reassignment / Data Edit", confidence=int(r["confidence"]), evidence=r["evidence"])
+    reassign = detect_route_reassignments(routesum, gfl, legacy_tx)
+    for _, r in reassign.iterrows():
+        add_finding(
+            findings, level="Route/Product", metric="Event Count",
+            identifier=f"{r['identifier']}: Legacy Route {r['legacy_route']} → GFL Route {r['gfl_route']}",
+            legacy=float(r["count"]), gfl=float(r["count"]),
+            cause="Possible route reassignment / Data Edit", confidence=int(r["confidence"]),
+            evidence=r["evidence"], status="Explained", severity="Warning"
+        )
 
-    # Run / Trip derived comparisons. These are lower-confidence because Legacy transaction detail can contain issuance/nonboarding events.
+    # Run/trip derived comparison using transaction detail if supplied.
     runtrip = pd.DataFrame()
-    if not ltx.empty:
-        ld = ltx[ltx["is_fare_event"]].groupby(["route", "run", "trip"], dropna=False)["expected_ridership"].sum().rename("legacy_derived_ridership")
-        gd = gfl.groupby(["route", "run", "trip"], dropna=False)["adjusted_ridership"].sum().rename("gfl_adjusted_ridership")
-        runtrip = pd.concat([ld, gd], axis=1).fillna(0).reset_index()
-        runtrip["difference"] = runtrip["gfl_adjusted_ridership"] - runtrip["legacy_derived_ridership"]
-        for _, r in runtrip[runtrip.difference.abs() > 1e-9].iterrows():
-            add_finding(findings, level="Route/Run/Trip", metric="Derived Ridership", identifier=f"Route {r['route']} / Run {r['run']} / Trip {r['trip']}",
-                        legacy=float(r["legacy_derived_ridership"]), gfl=float(r["gfl_adjusted_ridership"]), adjusted_gfl=float(r["gfl_adjusted_ridership"]),
-                        cause="Possible route/run/trip reassignment, filter difference, or unmatched fare event", confidence=70,
-                        evidence="Legacy value is derived from Transaction Detail fare identifiers and current ridership rules; use supporting transactions to confirm.")
+    if legacy_tx is not None and not legacy_tx.route_run_trip_identifier.empty:
+        l = legacy_tx.route_run_trip_identifier.copy()
+        l["counts_ridership"] = l["identifier"].map(rules)
+        l = l[l["counts_ridership"].eq(True)]
+        ld = l.groupby(["route", "run", "trip"], as_index=False)["event_count"].sum().rename(columns={"event_count": "legacy_derived_ridership"})
+        gd = gfl.route_run_trip.copy()
+        # Start with raw run/trip ridership, then remove inferred non-rider identifiers at the same route/run/trip.
+        gi = gfl.route_run_trip_identifier.copy()
+        gi["counts_ridership"] = gi["identifier"].map(rules)
+        subtract = gi[gi["counts_ridership"].eq(False)].groupby(["route", "run", "trip"], as_index=False)["ridership"].sum().rename(columns={"ridership": "remove"})
+        gd = gd.merge(subtract, on=["route", "run", "trip"], how="left").fillna({"remove": 0})
+        gd["gfl_normalized_ridership"] = gd["ridership"] - gd["remove"]
+        runtrip = ld.merge(gd[["route", "run", "trip", "gfl_normalized_ridership"]], on=["route", "run", "trip"], how="outer").fillna(0)
+        runtrip["difference"] = runtrip["gfl_normalized_ridership"] - runtrip["legacy_derived_ridership"]
+        for _, r in runtrip[runtrip["difference"].abs() > 1e-9].iterrows():
+            add_finding(
+                findings, level="Route/Run/Trip", metric="Derived Ridership",
+                identifier=f"Route {r['route']} / Run {r['run']} / Trip {r['trip']}",
+                legacy=float(r["legacy_derived_ridership"]), gfl=float(r["gfl_normalized_ridership"]),
+                cause="Possible route/run/trip reassignment, report filter difference, or unmatched event",
+                confidence=72,
+                evidence="Legacy Transaction Detail has no direct Ridership column here; value is derived from inferred Legacy fare-category rules."
+            )
 
-    findings_df = pd.DataFrame(findings, columns=FINDING_COLUMNS)
-    # Sort differences first, then hierarchy.
-    if not findings_df.empty:
-        findings_df["_absdiff"] = pd.to_numeric(findings_df["Difference"], errors="coerce").abs().fillna(0)
-        findings_df = findings_df.sort_values(["_absdiff", "Level", "Identifier"], ascending=[False, True, True]).drop(columns="_absdiff").reset_index(drop=True)
+    f = pd.DataFrame(findings, columns=FINDING_COLUMNS)
+    if not f.empty:
+        f["_abs"] = pd.to_numeric(f["Difference"], errors="coerce").abs().fillna(0)
+        f = f.sort_values(["_abs", "Level", "Identifier"], ascending=[False, True, True]).drop(columns="_abs").reset_index(drop=True)
 
     return {
-        "findings": findings_df,
-        "gfl_adjusted": gfl,
-        "legacy_tx_adjusted": ltx,
+        "findings": f,
+        "rule_inference": inference,
         "route_reassignments": reassign,
         "run_trip": runtrip,
         "summary": {
             "legacy_ridership": legacy_riders,
-            "gfl_raw_ridership": raw_gfl_riders,
-            "gfl_adjusted_ridership": adj_gfl_riders,
-            "legacy_revenue": legacy_rev,
-            "gfl_revenue": gfl_revenue,
-            "gfl_ridership_amount_charged": gfl_amount,
-            "ridership_rule_adjustment": removed,
-        }
+            "gfl_raw_ridership": raw_gfl,
+            "gfl_legacy_rule_normalized_ridership": normalized_gfl,
+            "inferred_rule_adjustment": removed,
+            "legacy_revenue": legacy_revenue,
+            "gfl_revenue": gfl_rev_total,
+            "gfl_amount_charged": gfl_amount,
+            "rule_confidence": inference.confidence,
+            "rule_exact_fit": inference.exact_fit,
+            "rule_source": inference.source,
+            "gfl_rows": int(gfl.totals.get("rows", 0)),
+            "legacy_transaction_rows": int(legacy_tx.totals.get("rows", 0)) if legacy_tx is not None else 0,
+        },
     }
