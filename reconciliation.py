@@ -8,6 +8,7 @@ import pandas as pd
 from inference import RuleInference, infer_legacy_ridership_rules
 from large_csv import LargeCSVProfile
 from legacy_routesum import LegacyRouteSum
+from drilldown import build_drilldowns
 
 
 FINDING_COLUMNS = [
@@ -154,8 +155,7 @@ def detect_route_reassignments(routesum: LegacyRouteSum, gfl: LargeCSVProfile, l
 
 
 def reconcile(gfl: LargeCSVProfile, routesum: LegacyRouteSum,
-              legacy_tx: Optional[LargeCSVProfile] = None,
-              gfl_revenue: Optional[LargeCSVProfile] = None) -> dict:
+              legacy_tx: Optional[LargeCSVProfile] = None) -> dict:
     findings = []
     inference = infer_legacy_ridership_rules(routesum, legacy_tx)
     rules = _rule_map(inference)
@@ -178,25 +178,6 @@ def reconcile(gfl: LargeCSVProfile, routesum: LegacyRouteSum,
             legacy=legacy_riders, gfl=normalized_gfl, cause=cause,
             confidence=inference.confidence,
             evidence=f"Automatic Legacy rule inference removed {removed:g} GFL riders; no manual ridership rules were supplied."
-        )
-
-    legacy_revenue = float(routesum.totals.get("total_revenue", 0))
-    gfl_amount = float(gfl.totals.get("amount_charged", 0))
-    gfl_rev_total = float(gfl_revenue.totals.get("revenue", 0)) if gfl_revenue is not None else gfl_amount
-    add_finding(
-        findings, level="Overall", metric="Revenue", identifier="Total revenue",
-        legacy=legacy_revenue, gfl=gfl_rev_total,
-        cause="Matched total revenue" if abs(gfl_rev_total - legacy_revenue) < 0.01 else "Revenue total mismatch",
-        confidence=100 if abs(gfl_rev_total - legacy_revenue) < 0.01 else 80,
-        evidence="GFL uses optional Revenue Raw Data when supplied; otherwise it uses Amount Charged from the Ridership Raw Data export. Legacy uses Current + Unclassified Revenue."
-    )
-    if gfl_revenue is not None:
-        add_finding(
-            findings, level="Validation", metric="Revenue", identifier="GFL Revenue file vs Ridership Amount Charged",
-            legacy=gfl_amount, gfl=float(gfl_revenue.totals.get("revenue", 0)),
-            cause="Independent GFL exports reconcile" if abs(float(gfl_revenue.totals.get("revenue", 0)) - gfl_amount) < 0.01 else "GFL exports disagree",
-            confidence=100,
-            evidence="Optional cross-check only; the Revenue Raw Data file is not required."
         )
 
     # Legacy internal fit and hidden ridership contributions.
@@ -266,14 +247,11 @@ def reconcile(gfl: LargeCSVProfile, routesum: LegacyRouteSum,
                 evidence=f"Legacy key presses={r['legacy_event_count']:g}; detailed key-ridership page shows {displayed:g}, but route/overall totals require {inferred:g}."
             )
 
-    # Route comparison after applying automatically inferred Legacy rules to GFL.
+    # Route ridership comparison after applying automatically inferred Legacy rules to GFL.
     norm_route = _normalized_route_gfl(gfl, rules)
     if not routesum.route_summary.empty:
-        lr = routesum.route_summary[["route", "ridership", "current_revenue", "unclassified_revenue"]].copy()
-        lr["legacy_revenue"] = lr["current_revenue"] + lr["unclassified_revenue"]
+        lr = routesum.route_summary[["route", "ridership"]].copy()
         rc = lr.merge(norm_route, on="route", how="outer").fillna(0)
-        gfl_route_rev = (gfl_revenue.route_revenue if gfl_revenue is not None else gfl.route_revenue).rename(columns={"revenue": "gfl_revenue"})
-        rc = rc.merge(gfl_route_rev, on="route", how="outer").fillna(0)
         for _, r in rc.iterrows():
             ld, gd = float(r["ridership"]), float(r["gfl_normalized_ridership"])
             add_finding(
@@ -281,12 +259,6 @@ def reconcile(gfl: LargeCSVProfile, routesum: LegacyRouteSum,
                 cause="Matched route ridership" if abs(gd-ld)<1e-9 else "Route allocation difference, Data Edit, or missing/extra transactions",
                 confidence=100 if abs(gd-ld)<1e-9 else 72,
                 evidence="GFL route ridership is normalized using automatically inferred Legacy ridership behavior."
-            )
-            add_finding(
-                findings, level="Route", metric="Revenue", identifier=f"Route {r['route']}", legacy=float(r["legacy_revenue"]), gfl=float(r["gfl_revenue"]),
-                cause="Matched route revenue" if abs(float(r["gfl_revenue"])-float(r["legacy_revenue"]))<0.01 else "Route revenue allocation difference",
-                confidence=100 if abs(float(r["gfl_revenue"])-float(r["legacy_revenue"]))<0.01 else 75,
-                evidence="Legacy route revenue = Current + Unclassified Revenue."
             )
 
     reassign = detect_route_reassignments(routesum, gfl, legacy_tx)
@@ -325,6 +297,8 @@ def reconcile(gfl: LargeCSVProfile, routesum: LegacyRouteSum,
                 evidence="Legacy Transaction Detail has no direct Ridership column here; value is derived from inferred Legacy fare-category rules."
             )
 
+    drilldowns = build_drilldowns(gfl, routesum, legacy_tx, inference, rules)
+
     f = pd.DataFrame(findings, columns=FINDING_COLUMNS)
     if not f.empty:
         f["_abs"] = pd.to_numeric(f["Difference"], errors="coerce").abs().fillna(0)
@@ -335,14 +309,12 @@ def reconcile(gfl: LargeCSVProfile, routesum: LegacyRouteSum,
         "rule_inference": inference,
         "route_reassignments": reassign,
         "run_trip": runtrip,
+        "drilldowns": drilldowns,
         "summary": {
             "legacy_ridership": legacy_riders,
             "gfl_raw_ridership": raw_gfl,
             "gfl_legacy_rule_normalized_ridership": normalized_gfl,
             "inferred_rule_adjustment": removed,
-            "legacy_revenue": legacy_revenue,
-            "gfl_revenue": gfl_rev_total,
-            "gfl_amount_charged": gfl_amount,
             "rule_confidence": inference.confidence,
             "rule_exact_fit": inference.exact_fit,
             "rule_source": inference.source,

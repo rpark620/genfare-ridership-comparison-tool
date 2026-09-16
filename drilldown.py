@@ -1,0 +1,272 @@
+from __future__ import annotations
+
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+
+from inference import RuleInference
+from large_csv import LargeCSVProfile
+from legacy_routesum import LegacyRouteSum
+from transaction_match import match_remaining_transactions
+
+
+def _norm_date(values: pd.Series) -> pd.Series:
+    parsed = pd.to_datetime(values, errors="coerce")
+    out = parsed.dt.strftime("%Y-%m-%d")
+    return out.fillna(values.astype(str).str.strip())
+
+
+def _type_for_identifier(identifier: str) -> str:
+    if str(identifier).startswith("KEY "):
+        return "Key"
+    if str(identifier).startswith("TTP "):
+        return "TTP"
+    if identifier == "PRESET":
+        return "Preset"
+    return "Other"
+
+
+def _legacy_day_totals(routesum: LegacyRouteSum, legacy_tx: Optional[LargeCSVProfile], rules: dict[str, bool]):
+    rd = getattr(routesum, "route_date_summary", pd.DataFrame())
+    if rd is not None and not rd.empty and "date" in rd.columns:
+        work = rd.copy()
+        work["date"] = _norm_date(work["date"])
+        work = work[work["date"].ne("")]
+        if not work.empty:
+            out = work.groupby("date", as_index=False)["ridership"].sum().rename(columns={"ridership": "legacy_ridership"})
+            out["legacy_source"] = "ROUTESUM by route-date"
+            return out
+    if legacy_tx is not None and not legacy_tx.day_identifier.empty:
+        work = legacy_tx.day_identifier.copy()
+        work["counts_ridership"] = work["identifier"].map(rules)
+        work = work[work["counts_ridership"].eq(True)]
+        out = work.groupby("date", as_index=False)["event_count"].sum().rename(columns={"event_count": "legacy_ridership"})
+        out["legacy_source"] = "Derived from Legacy Transaction Detail + inferred ridership behavior"
+        return out
+    return pd.DataFrame(columns=["date", "legacy_ridership", "legacy_source"])
+
+
+def build_day_comparison(gfl: LargeCSVProfile, routesum: LegacyRouteSum, legacy_tx: Optional[LargeCSVProfile], rules: dict[str, bool]) -> pd.DataFrame:
+    legacy = _legacy_day_totals(routesum, legacy_tx, rules)
+    if legacy.empty or gfl.day_summary.empty:
+        return pd.DataFrame(columns=["Date", "Legacy Ridership", "GFL Raw Ridership", "Raw Difference", "GFL Normalized Ridership", "Normalized Difference", "Legacy Source", "Status"])
+    raw = gfl.day_summary[["date", "ridership"]].rename(columns={"ridership": "gfl_raw_ridership"})
+    if not gfl.day_identifier.empty:
+        norm = gfl.day_identifier.copy()
+        norm["counts_ridership"] = norm["identifier"].map(rules)
+        norm["normalized"] = norm["ridership"]
+        norm.loc[norm["counts_ridership"].eq(False), "normalized"] = 0.0
+        norm = norm.groupby("date", as_index=False)["normalized"].sum().rename(columns={"normalized": "gfl_normalized_ridership"})
+    else:
+        norm = raw.rename(columns={"gfl_raw_ridership": "gfl_normalized_ridership"})
+    out = legacy.merge(raw, on="date", how="outer").merge(norm, on="date", how="outer")
+    for c in ["legacy_ridership", "gfl_raw_ridership", "gfl_normalized_ridership"]:
+        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0)
+    out["legacy_source"] = out.get("legacy_source", "").fillna("No Legacy daily total available")
+    out["raw_difference"] = out["gfl_raw_ridership"] - out["legacy_ridership"]
+    out["normalized_difference"] = out["gfl_normalized_ridership"] - out["legacy_ridership"]
+    out["status"] = np.where(out["normalized_difference"].abs() < 1e-9, "Reconciled after behavior normalization", np.where(out["raw_difference"].abs() < 1e-9, "Raw match", "Needs drill-down"))
+    return out.rename(columns={
+        "date": "Date", "legacy_ridership": "Legacy Ridership", "gfl_raw_ridership": "GFL Raw Ridership",
+        "raw_difference": "Raw Difference", "gfl_normalized_ridership": "GFL Normalized Ridership",
+        "normalized_difference": "Normalized Difference", "legacy_source": "Legacy Source", "status": "Status",
+    }).sort_values("Date").reset_index(drop=True)
+
+
+def build_day_identifier_comparison(gfl: LargeCSVProfile, legacy_tx: Optional[LargeCSVProfile], inference: RuleInference, rules: dict[str, bool]) -> pd.DataFrame:
+    columns = ["Date", "Type", "Identifier", "Legacy Events", "GFL Ridership Records", "Record Difference", "Legacy Expected Riders", "GFL Riders", "Rider Difference", "Legacy Counts Ridership", "GFL Riders/Record", "Problem Summary", "Likely Cause", "Evidence"]
+    if legacy_tx is None or legacy_tx.day_identifier.empty or gfl.day_identifier.empty:
+        return pd.DataFrame(columns=columns)
+    l = legacy_tx.day_identifier[["date", "identifier", "event_count"]].rename(columns={"event_count": "legacy_events"})
+    g = gfl.day_identifier[["date", "identifier", "event_count", "ridership"]].rename(columns={"event_count": "gfl_events", "ridership": "gfl_riders"})
+    out = l.merge(g, on=["date", "identifier"], how="outer").fillna(0)
+    display_mismatch = set()
+    if not inference.rules.empty and "legacy_display_mismatch" in inference.rules.columns:
+        display_mismatch = set(inference.rules.loc[inference.rules["legacy_display_mismatch"].eq(True), "identifier"].astype(str))
+    rows = []
+    for _, r in out.iterrows():
+        ident = str(r["identifier"])
+        legacy_events = float(r["legacy_events"])
+        gfl_events = float(r["gfl_events"])
+        gfl_riders = float(r["gfl_riders"])
+        rule = rules.get(ident)
+        expected = legacy_events if rule is True else (0.0 if rule is False else np.nan)
+        gfl_rate = gfl_riders / gfl_events if gfl_events else 0.0
+        record_diff = gfl_events - legacy_events
+        rider_diff = gfl_riders - expected if not pd.isna(expected) else np.nan
+        if rule is False and abs(gfl_riders) < 1e-9:
+            summary = "Legacy records the fare event, while GFL correctly contributes 0 riders for this category"
+            cause = "Expected non-rider category behavior"
+        elif ident in display_mismatch and (pd.isna(rider_diff) or abs(rider_diff) < 1e-9):
+            summary = "Legacy detailed key-ridership display is misleading, but actual ridership behavior reconciles"
+            cause = "Legacy internal key-ridership display inconsistency"
+        elif not pd.isna(rider_diff) and abs(rider_diff) > 1e-9:
+            if rule is False and gfl_riders > 0:
+                summary = f"Legacy expects 0 riders, but GFL contributes {gfl_riders:g}"
+                cause = "Ridership-rule/configuration difference"
+            else:
+                summary = f"Rider contribution differs by {rider_diff:+g}"
+                cause = "Missing/extra ridership records, report scope difference, or configuration difference"
+        elif rule is True and abs(record_diff) > 1e-9:
+            summary = f"Rider totals reconcile, but raw record counts differ by {record_diff:+g}"
+            cause = "Duplicate/zero-ridership row behavior or report-recording difference"
+        elif rule is None and abs(record_diff) > 1e-9:
+            summary = f"Record count differs by {record_diff:+g} and Legacy rider behavior could not be inferred"
+            cause = "Unresolved record-count discrepancy"
+        else:
+            summary = "Ridership behavior matches"
+            cause = "Match"
+        evidence = f"Legacy events={legacy_events:g}; GFL ridership-export records={gfl_events:g}; GFL riders={gfl_riders:g}."
+        if rule is not None:
+            evidence += f" Inferred Legacy counts-ridership={bool(rule)}."
+        rows.append({
+            "Date": str(r["date"]), "Type": _type_for_identifier(ident), "Identifier": ident,
+            "Legacy Events": legacy_events, "GFL Ridership Records": gfl_events, "Record Difference": record_diff,
+            "Legacy Expected Riders": expected, "GFL Riders": gfl_riders, "Rider Difference": rider_diff,
+            "Legacy Counts Ridership": rule, "GFL Riders/Record": gfl_rate,
+            "Problem Summary": summary, "Likely Cause": cause, "Evidence": evidence,
+        })
+    result = pd.DataFrame(rows, columns=columns)
+    result["_abs"] = result["Record Difference"].abs() + pd.to_numeric(result["Rider Difference"], errors="coerce").abs().fillna(0)
+    return result.sort_values(["Date", "_abs", "Type", "Identifier"], ascending=[True, False, True, True]).drop(columns="_abs").reset_index(drop=True)
+
+
+def _detail_merge(gfl: LargeCSVProfile, legacy_tx: Optional[LargeCSVProfile]) -> pd.DataFrame:
+    columns = ["Date", "Route", "Run", "Bus", "Identifier", "Legacy Events", "GFL Ridership Records", "GFL Riders", "Record Difference"]
+    if legacy_tx is None or legacy_tx.day_route_run_bus_identifier.empty or gfl.day_route_run_bus_identifier.empty:
+        return pd.DataFrame(columns=columns)
+    l = legacy_tx.day_route_run_bus_identifier.rename(columns={"date": "Date", "route": "Route", "run": "Run", "bus": "Bus", "identifier": "Identifier", "event_count": "Legacy Events"})
+    g = gfl.day_route_run_bus_identifier.rename(columns={"date": "Date", "route": "Route", "run": "Run", "bus": "Bus", "identifier": "Identifier", "event_count": "GFL Ridership Records", "ridership": "GFL Riders"})
+    out = l[["Date", "Route", "Run", "Bus", "Identifier", "Legacy Events"]].merge(
+        g[["Date", "Route", "Run", "Bus", "Identifier", "GFL Ridership Records", "GFL Riders"]],
+        on=["Date", "Route", "Run", "Bus", "Identifier"], how="outer"
+    ).fillna(0)
+    out["Record Difference"] = out["GFL Ridership Records"] - out["Legacy Events"]
+    return out[columns]
+
+
+def _aggregate_dimension(detail: pd.DataFrame, dims: list[str]) -> pd.DataFrame:
+    if detail.empty:
+        return pd.DataFrame()
+    group = ["Date", "Identifier"] + dims
+    out = detail.groupby(group, as_index=False).agg({"Legacy Events": "sum", "GFL Ridership Records": "sum", "GFL Riders": "sum"})
+    out["Record Difference"] = out["GFL Ridership Records"] - out["Legacy Events"]
+    return out
+
+
+def _pair_offsets(df: pd.DataFrame, context_cols: list[str], location_col: str, level: str) -> list[dict]:
+    results = []
+    if df.empty:
+        return results
+    for context, group in df.groupby(context_cols, dropna=False):
+        if not isinstance(context, tuple):
+            context = (context,)
+        total_diff = float(group["Record Difference"].sum())
+        if abs(total_diff) > 1e-9:
+            continue
+        pos = [[str(r[location_col]), float(r["Record Difference"])] for _, r in group[group["Record Difference"] > 0].iterrows()]
+        neg = [[str(r[location_col]), float(-r["Record Difference"])] for _, r in group[group["Record Difference"] < 0].iterrows()]
+        pi = ni = 0
+        while pi < len(pos) and ni < len(neg):
+            to_loc, pv = pos[pi]
+            from_loc, nv = neg[ni]
+            amount = min(pv, nv)
+            if amount > 0:
+                ctx = dict(zip(context_cols, context))
+                identifier = str(ctx.get("Identifier", ""))
+                date = str(ctx.get("Date", ""))
+                if level == "Route":
+                    cause = "Likely route reassignment / Legacy Data Edit"
+                    conf = 96
+                elif level == "Run":
+                    cause = "Likely run reassignment within the same route"
+                    conf = 93
+                else:
+                    cause = "Likely bus assignment/reporting difference"
+                    conf = 90
+                evidence = f"{date} {identifier}: equal-and-opposite {amount:g}-event movement from {level} {from_loc} in Legacy to {level} {to_loc} in GFL; total category count for this comparison context is unchanged."
+                results.append({
+                    "Date": date, "Identifier": identifier, "Level": level,
+                    "Legacy Location": from_loc, "GFL Location": to_loc, "Count": amount,
+                    "Likely Cause": cause, "Confidence %": conf, "Evidence": evidence,
+                })
+            pos[pi][1] -= amount
+            neg[ni][1] -= amount
+            if pos[pi][1] <= 1e-9:
+                pi += 1
+            if neg[ni][1] <= 1e-9:
+                ni += 1
+    return results
+
+
+def build_specific_comparisons(gfl: LargeCSVProfile, legacy_tx: Optional[LargeCSVProfile]):
+    detail = _detail_merge(gfl, legacy_tx)
+    if detail.empty:
+        return {
+            "route": pd.DataFrame(), "run": pd.DataFrame(), "bus": pd.DataFrame(),
+            "route_run_bus": detail, "movements": pd.DataFrame(),
+        }
+    route = _aggregate_dimension(detail, ["Route"])
+    run = _aggregate_dimension(detail, ["Route", "Run"])
+    bus = _aggregate_dimension(detail, ["Route", "Bus"])
+    movement_rows = []
+    movement_rows += _pair_offsets(route, ["Date", "Identifier"], "Route", "Route")
+    movement_rows += _pair_offsets(run, ["Date", "Identifier", "Route"], "Run", "Run")
+    movement_rows += _pair_offsets(bus, ["Date", "Identifier", "Route"], "Bus", "Bus")
+    movements = pd.DataFrame(movement_rows)
+    if not movements.empty:
+        movements = movements.sort_values(["Date", "Count", "Identifier"], ascending=[True, False, True]).reset_index(drop=True)
+    return {"route": route, "run": run, "bus": bus, "route_run_bus": detail, "movements": movements}
+
+
+def build_drilldowns(gfl: LargeCSVProfile, routesum: LegacyRouteSum, legacy_tx: Optional[LargeCSVProfile], inference: RuleInference, rules: dict[str, bool]) -> dict:
+    day = build_day_comparison(gfl, routesum, legacy_tx, rules)
+    day_ident = build_day_identifier_comparison(gfl, legacy_tx, inference, rules)
+    specific = build_specific_comparisons(gfl, legacy_tx)
+
+    targets = set()
+    if not day_ident.empty:
+        problem = day_ident[(pd.to_numeric(day_ident["Rider Difference"], errors="coerce").abs() > 1e-9) | day_ident["Likely Cause"].isin(["Unresolved record-count discrepancy", "Legacy internal key-ridership display inconsistency"])]
+        for _, r in problem.iterrows():
+            if rules.get(str(r["Identifier"])) is True:
+                targets.add((str(r["Date"]), str(r["Identifier"])))
+    route = specific.get("route", pd.DataFrame())
+    if route is not None and not route.empty:
+        for _, r in route[route["Record Difference"].abs() > 1e-9].iterrows():
+            if rules.get(str(r["Identifier"])) is True:
+                targets.add((str(r["Date"]), str(r["Identifier"])))
+
+    transaction_matches = pd.DataFrame()
+    transaction_error = ""
+    if legacy_tx is not None and targets:
+        try:
+            transaction_matches = match_remaining_transactions(gfl.source_path, legacy_tx.source_path, targets)
+        except Exception as exc:
+            transaction_error = str(exc)
+
+    notes = []
+    if legacy_tx is None:
+        notes.append("Legacy Transaction Detail was not uploaded, so day/category, route/run/bus, and transaction-match drill-downs are limited.")
+    elif day.empty:
+        notes.append("Daily ridership could not be derived from the supplied formats.")
+    if transaction_error:
+        notes.append(f"Targeted transaction matching could not complete: {transaction_error}")
+    if not day.empty and "Legacy Source" in day.columns and day["Legacy Source"].str.contains("Derived", na=False).any():
+        derived_total = float(day["Legacy Ridership"].sum())
+        authoritative = float(routesum.totals.get("ridership", 0))
+        if abs(derived_total - authoritative) > 1e-9:
+            notes.append(f"Daily Legacy ridership is derived from Transaction Detail and sums to {derived_total:g}, while authoritative ROUTESUM total is {authoritative:g}; use the daily drill-down directionally and inspect the residual.")
+
+    return {
+        "day_comparison": day,
+        "day_identifier": day_ident,
+        "route_comparison_by_day": specific.get("route", pd.DataFrame()),
+        "run_comparison_by_day": specific.get("run", pd.DataFrame()),
+        "bus_comparison_by_day": specific.get("bus", pd.DataFrame()),
+        "route_run_bus_by_day": specific.get("route_run_bus", pd.DataFrame()),
+        "equal_opposite_movements": specific.get("movements", pd.DataFrame()),
+        "transaction_matches": transaction_matches,
+        "transaction_targets": sorted(targets),
+        "notes": notes,
+    }

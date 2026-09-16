@@ -15,6 +15,7 @@ from pypdf import PdfReader
 class LegacyRouteSum:
     kind: str
     route_summary: pd.DataFrame = field(default_factory=pd.DataFrame)
+    route_date_summary: pd.DataFrame = field(default_factory=pd.DataFrame)
     key_counts: pd.DataFrame = field(default_factory=pd.DataFrame)
     key_display_ridership: pd.DataFrame = field(default_factory=pd.DataFrame)
     ttp_counts: pd.DataFrame = field(default_factory=pd.DataFrame)
@@ -97,6 +98,7 @@ def parse_routesum_pdf(file_obj) -> LegacyRouteSum:
             except Exception:
                 continue
     route = pd.DataFrame(route_rows)
+    route_date = route.copy()
     if not route.empty:
         route = route.groupby("route", as_index=False).agg(
             current_revenue=("current_revenue", "sum"),
@@ -225,6 +227,7 @@ def parse_routesum_pdf(file_obj) -> LegacyRouteSum:
     return LegacyRouteSum(
         kind="LEGACY_ROUTESUM_PDF",
         route_summary=route,
+        route_date_summary=route_date,
         key_counts=key_counts,
         key_display_ridership=key_display,
         ttp_counts=ttp_counts,
@@ -279,6 +282,7 @@ def parse_routesum_csv(file_obj) -> LegacyRouteSum:
             "dump_count": num(dump_i), "preset": num(preset_i), "ridership": num(rid_i),
         })
     route = pd.DataFrame(records)
+    route_date = route.copy()
     if not route.empty:
         route = route.groupby("route", as_index=False).agg(
             current_revenue=("current_revenue", "sum"), unclassified_revenue=("unclassified_revenue", "sum"),
@@ -293,6 +297,7 @@ def parse_routesum_csv(file_obj) -> LegacyRouteSum:
     return LegacyRouteSum(
         kind="LEGACY_ROUTESUM_CSV",
         route_summary=route,
+        route_date_summary=route_date,
         totals=totals,
         warnings=[
             "ROUTESUM CSV summary totals were parsed, but Legacy CSV TTP/key matrices are not consistently labeled across exports. "

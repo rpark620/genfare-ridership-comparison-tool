@@ -26,7 +26,11 @@ class LargeCSVProfile:
     route_identifier: pd.DataFrame = field(default_factory=pd.DataFrame)
     route_run_trip: pd.DataFrame = field(default_factory=pd.DataFrame)
     route_run_trip_identifier: pd.DataFrame = field(default_factory=pd.DataFrame)
-    route_revenue: pd.DataFrame = field(default_factory=pd.DataFrame)
+    day_summary: pd.DataFrame = field(default_factory=pd.DataFrame)
+    day_identifier: pd.DataFrame = field(default_factory=pd.DataFrame)
+    day_route_identifier: pd.DataFrame = field(default_factory=pd.DataFrame)
+    day_route_run_bus_identifier: pd.DataFrame = field(default_factory=pd.DataFrame)
+    transaction_signatures: pd.DataFrame = field(default_factory=pd.DataFrame)
     metadata: Dict[str, str] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
     confidence: int = 100
@@ -36,7 +40,6 @@ def _connect() -> duckdb.DuckDBPyConnection:
     con = duckdb.connect(database=":memory:")
     con.execute("PRAGMA threads=2")
     con.execute("PRAGMA preserve_insertion_order=false")
-    # DuckDB can spill hash/group-by work to disk instead of forcing everything into RAM.
     try:
         con.execute("PRAGMA memory_limit='900MB'")
     except Exception:
@@ -60,8 +63,33 @@ def _col_expr(col: Optional[str], alias: str, numeric: bool = False) -> str:
     return f"COALESCE(CAST({q} AS VARCHAR), '') AS {quote_ident(alias)}"
 
 
+def _date_expr(col: str = "transaction_time") -> str:
+    q = quote_ident(col)
+    return (
+        "COALESCE("
+        f"strftime(TRY_STRPTIME({q}, '%Y-%m-%d %H:%M:%S'), '%Y-%m-%d'),"
+        f"strftime(TRY_STRPTIME({q}, '%m/%d/%Y %H:%M:%S'), '%Y-%m-%d'),"
+        f"strftime(TRY_STRPTIME({q}, '%m/%d/%Y %H:%M'), '%Y-%m-%d'),"
+        "''"
+        ")"
+    )
+
+
+def _timestamp_expr(col: str = "transaction_time") -> str:
+    q = quote_ident(col)
+    return (
+        "COALESCE("
+        f"strftime(TRY_STRPTIME({q}, '%Y-%m-%d %H:%M:%S'), '%Y-%m-%d %H:%M:%S'),"
+        f"strftime(TRY_STRPTIME({q}, '%m/%d/%Y %H:%M:%S'), '%Y-%m-%d %H:%M:%S'),"
+        f"strftime(TRY_STRPTIME({q}, '%m/%d/%Y %H:%M'), '%Y-%m-%d %H:%M:%S'),"
+        f"CAST({q} AS VARCHAR)"
+        ")"
+    )
+
+
 def _canonicalize_aggregates(df: pd.DataFrame, key_col="key_ttp_raw", key_raw_col=None, ttp_raw_col=None) -> pd.DataFrame:
     if df.empty:
+        df = df.copy()
         df["identifier"] = pd.Series(dtype="object")
         return df
     df = df.copy()
@@ -75,10 +103,25 @@ def _canonicalize_aggregates(df: pd.DataFrame, key_col="key_ttp_raw", key_raw_co
         )
         for _, row in df.iterrows()
     ]
-    for c in ["route", "run", "trip", "bus"]:
+    for c in ["route", "run", "trip", "bus", "driver"]:
         if c in df.columns:
             df[c] = df[c].map(clean_dimension)
+    if "date" in df.columns:
+        df["date"] = df["date"].astype(str)
+    if "timestamp" in df.columns:
+        df["timestamp"] = df["timestamp"].astype(str)
     return df
+
+
+def _group_identifier(df: pd.DataFrame, group_cols: list[str], has_ridership: bool) -> pd.DataFrame:
+    if df.empty:
+        cols = group_cols + ["identifier", "event_count"] + (["ridership"] if has_ridership else [])
+        return pd.DataFrame(columns=cols)
+    df = df[df["identifier"].ne("")].copy()
+    agg = {"event_count": ("event_count", "sum")}
+    if has_ridership:
+        agg["ridership"] = ("ridership", "sum")
+    return df.groupby(group_cols + ["identifier"], dropna=False, as_index=False).agg(**agg)
 
 
 def profile_gfl_ridership(path: str) -> LargeCSVProfile:
@@ -86,7 +129,6 @@ def profile_gfl_ridership(path: str) -> LargeCSVProfile:
     rid_col = find_header_column(headers, ["Ridership", "Boardings", "Riders"])
     route_col = find_header_column(headers, ["Route", "Route Number", "Route ID"])
     keyttp_col = find_header_column(headers, ["Key/TTP", "Key TTP", "Fare Identifier"])
-    amount_col = find_header_column(headers, ["Amount Charged", "Amount", "Charge"])
     if not rid_col or not route_col:
         raise ValueError("This does not look like a GFL Ridership Raw Data export: Ridership and/or Route was not found.")
 
@@ -94,100 +136,104 @@ def profile_gfl_ridership(path: str) -> LargeCSVProfile:
         "transaction_time": find_header_column(headers, ["Transaction Time", "Date Time", "Timestamp"]),
         "product_type": find_header_column(headers, ["Product Type"]),
         "product": find_header_column(headers, ["Product"]),
-        "organization": find_header_column(headers, ["Organization", "Agency"]),
-        "media_type": find_header_column(headers, ["Media Type"]),
         "bus": find_header_column(headers, ["Bus Number", "Bus"]),
         "driver": find_header_column(headers, ["Driver"]),
         "route": route_col,
         "run": find_header_column(headers, ["Run"]),
         "trip": find_header_column(headers, ["Trip"]),
-        "fareset": find_header_column(headers, ["Fareset ID", "FS", "Fareset"]),
         "key_ttp_raw": keyttp_col,
-        "amount_charged": amount_col,
         "ridership": rid_col,
     }
     select = ",\n".join([
+        _col_expr(mapping["transaction_time"], "transaction_time"),
         _col_expr(mapping["product_type"], "product_type"),
         _col_expr(mapping["product"], "product"),
         _col_expr(mapping["route"], "route"),
         _col_expr(mapping["run"], "run"),
         _col_expr(mapping["trip"], "trip"),
         _col_expr(mapping["bus"], "bus"),
+        _col_expr(mapping["driver"], "driver"),
         _col_expr(mapping["key_ttp_raw"], "key_ttp_raw"),
         _col_expr(mapping["ridership"], "ridership", numeric=True),
-        _col_expr(mapping["amount_charged"], "amount_charged", numeric=True),
     ])
 
     con = _connect()
     try:
-        con.execute(f"CREATE TEMP VIEW src AS SELECT {select} FROM {_read_csv_expr(path)}")
-        totals = con.execute("""
-            SELECT COUNT(*) AS "rows",
-                   SUM(ridership) ridership,
-                   SUM(amount_charged) amount_charged
-            FROM src
-        """).fetchdf().iloc[0].to_dict()
+        con.execute(f"CREATE TEMP VIEW src0 AS SELECT {select} FROM {_read_csv_expr(path)}")
+        con.execute(f"""
+            CREATE TEMP VIEW src AS
+            SELECT *, {_date_expr()} AS date, {_timestamp_expr()} AS timestamp
+            FROM src0
+        """)
+        totals = con.execute('SELECT COUNT(*) AS "rows", SUM(ridership) AS ridership FROM src').fetchdf().iloc[0].to_dict()
 
-        ident = con.execute("""
-            SELECT product_type, product, key_ttp_raw,
-                   COUNT(*) event_count,
-                   SUM(ridership) ridership,
-                   SUM(amount_charged) amount_charged
-            FROM src
-            GROUP BY ALL
+        ident_raw = con.execute("""
+            SELECT product_type, product, key_ttp_raw, COUNT(*) event_count, SUM(ridership) ridership
+            FROM src GROUP BY ALL
         """).fetchdf()
-        ident = _canonicalize_aggregates(ident)
-        ident = ident.groupby("identifier", dropna=False, as_index=False).agg(
-            event_count=("event_count", "sum"), ridership=("ridership", "sum"), amount_charged=("amount_charged", "sum")
-        )
+        ident_raw = _canonicalize_aggregates(ident_raw)
+        ident = _group_identifier(ident_raw, [], True)
 
-        route_ident = con.execute("""
-            SELECT route, product_type, product, key_ttp_raw,
-                   COUNT(*) event_count,
-                   SUM(ridership) ridership,
-                   SUM(amount_charged) amount_charged
-            FROM src
-            GROUP BY ALL
+        route_ident_raw = con.execute("""
+            SELECT route, product_type, product, key_ttp_raw, COUNT(*) event_count, SUM(ridership) ridership
+            FROM src GROUP BY ALL
         """).fetchdf()
-        route_ident = _canonicalize_aggregates(route_ident)
-        route_ident = route_ident.groupby(["route", "identifier"], dropna=False, as_index=False).agg(
-            event_count=("event_count", "sum"), ridership=("ridership", "sum"), amount_charged=("amount_charged", "sum")
-        )
+        route_ident_raw = _canonicalize_aggregates(route_ident_raw)
+        route_ident = _group_identifier(route_ident_raw, ["route"], True)
 
         runtrip = con.execute("""
-            SELECT route, run, trip,
-                   COUNT(*) event_count,
-                   SUM(ridership) ridership,
-                   SUM(amount_charged) amount_charged
-            FROM src
-            GROUP BY ALL
+            SELECT route, run, trip, COUNT(*) event_count, SUM(ridership) ridership
+            FROM src GROUP BY ALL
         """).fetchdf()
         for c in ["route", "run", "trip"]:
             runtrip[c] = runtrip[c].map(clean_dimension)
 
-        runtrip_ident = con.execute("""
+        runtrip_ident_raw = con.execute("""
             SELECT route, run, trip, product_type, product, key_ttp_raw,
-                   COUNT(*) event_count,
-                   SUM(ridership) ridership
-            FROM src
-            GROUP BY ALL
+                   COUNT(*) event_count, SUM(ridership) ridership
+            FROM src GROUP BY ALL
         """).fetchdf()
-        runtrip_ident = _canonicalize_aggregates(runtrip_ident)
-        runtrip_ident = runtrip_ident[runtrip_ident["identifier"].ne("")]
-        if not runtrip_ident.empty:
-            runtrip_ident = runtrip_ident.groupby(["route", "run", "trip", "identifier"], as_index=False).agg(
-                event_count=("event_count", "sum"), ridership=("ridership", "sum")
-            )
+        runtrip_ident_raw = _canonicalize_aggregates(runtrip_ident_raw)
+        runtrip_ident = _group_identifier(runtrip_ident_raw, ["route", "run", "trip"], True)
 
-        route_rev = route_ident.groupby("route", as_index=False)["amount_charged"].sum().rename(columns={"amount_charged": "revenue"})
+        day_summary = con.execute("""
+            SELECT date, COUNT(*) event_count, SUM(ridership) ridership
+            FROM src WHERE date <> '' GROUP BY date ORDER BY date
+        """).fetchdf()
+
+        day_ident_raw = con.execute("""
+            SELECT date, product_type, product, key_ttp_raw,
+                   COUNT(*) event_count, SUM(ridership) ridership
+            FROM src WHERE date <> '' GROUP BY ALL
+        """).fetchdf()
+        day_ident_raw = _canonicalize_aggregates(day_ident_raw)
+        day_identifier = _group_identifier(day_ident_raw, ["date"], True)
+
+        day_route_ident_raw = con.execute("""
+            SELECT date, route, product_type, product, key_ttp_raw,
+                   COUNT(*) event_count, SUM(ridership) ridership
+            FROM src WHERE date <> '' GROUP BY ALL
+        """).fetchdf()
+        day_route_ident_raw = _canonicalize_aggregates(day_route_ident_raw)
+        day_route_identifier = _group_identifier(day_route_ident_raw, ["date", "route"], True)
+
+        day_detail_raw = con.execute("""
+            SELECT date, route, run, bus, product_type, product, key_ttp_raw,
+                   COUNT(*) event_count, SUM(ridership) ridership
+            FROM src WHERE date <> '' GROUP BY ALL
+        """).fetchdf()
+        day_detail_raw = _canonicalize_aggregates(day_detail_raw)
+        day_route_run_bus_identifier = _group_identifier(day_detail_raw, ["date", "route", "run", "bus"], True)
+
+        transaction_signatures = pd.DataFrame()
     finally:
         con.close()
 
     warnings = []
-    if not amount_col:
-        warnings.append("Amount Charged was not found. Upload the optional GFL Revenue Raw Data file if revenue comparison is needed.")
     if not keyttp_col:
         warnings.append("Key/TTP was not found. Key/TTP rule-difference analysis will be limited.")
+    if not mapping["transaction_time"]:
+        warnings.append("Transaction Time was not found. Day and transaction drill-downs will be unavailable.")
 
     return LargeCSVProfile(
         kind="GFL_RIDERSHIP_RAW",
@@ -197,50 +243,19 @@ def profile_gfl_ridership(path: str) -> LargeCSVProfile:
         route_identifier=route_ident,
         route_run_trip=runtrip,
         route_run_trip_identifier=runtrip_ident,
-        route_revenue=route_rev,
+        day_summary=day_summary,
+        day_identifier=day_identifier,
+        day_route_identifier=day_route_identifier,
+        day_route_run_bus_identifier=day_route_run_bus_identifier,
+        transaction_signatures=transaction_signatures,
         metadata={
             "ridership_column": rid_col,
-            "amount_column": amount_col or "not found",
             "key_ttp_column": keyttp_col or "not found",
+            "transaction_time_column": mapping["transaction_time"] or "not found",
             "engine": "DuckDB streaming/aggregate scan",
         },
         warnings=warnings,
         confidence=100 if keyttp_col else 90,
-    )
-
-
-def profile_gfl_revenue(path: str) -> LargeCSVProfile:
-    headers = read_csv_header(path)
-    rev_col = find_header_column(headers, ["Revenue", "Net Revenue", "Amount Charged"])
-    route_col = find_header_column(headers, ["Route", "Route Number", "Route ID"])
-    if not rev_col or not route_col:
-        raise ValueError("This does not look like a GFL Revenue Raw Data export.")
-    run_col = find_header_column(headers, ["Run"])
-    trip_col = find_header_column(headers, ["Trip"])
-    select = ",\n".join([
-        _col_expr(route_col, "route"),
-        _col_expr(run_col, "run"),
-        _col_expr(trip_col, "trip"),
-        _col_expr(rev_col, "revenue", numeric=True),
-    ])
-    con = _connect()
-    try:
-        con.execute(f"CREATE TEMP VIEW src AS SELECT {select} FROM {_read_csv_expr(path)}")
-        total = con.execute('SELECT COUNT(*) AS "rows", SUM(revenue) AS revenue FROM src').fetchdf().iloc[0].to_dict()
-        route = con.execute("SELECT route, SUM(revenue) revenue FROM src GROUP BY route").fetchdf()
-        rt = con.execute("SELECT route, run, trip, SUM(revenue) revenue FROM src GROUP BY ALL").fetchdf()
-        for df in [route, rt]:
-            for c in [x for x in ["route", "run", "trip"] if x in df.columns]:
-                df[c] = df[c].map(clean_dimension)
-    finally:
-        con.close()
-    return LargeCSVProfile(
-        kind="GFL_REVENUE_RAW",
-        source_path=path,
-        totals={k: float(v or 0) for k, v in total.items()},
-        route_revenue=route,
-        route_run_trip=rt,
-        metadata={"revenue_column": rev_col, "engine": "DuckDB streaming/aggregate scan"},
     )
 
 
@@ -255,8 +270,8 @@ def profile_legacy_transaction_detail(path: str) -> LargeCSVProfile:
     key_col = find_header_column(headers, ["Keys", "Key"])
     ttp_col = find_header_column(headers, ["TTP"])
     product_col = find_header_column(headers, ["Product"])
-    amount_col = find_header_column(headers, ["Amt Chrg", "Amount Charged", "Amount"])
     bus_col = find_header_column(headers, ["Bus"])
+    driver_col = find_header_column(headers, ["Driver"])
     if not tx_col or not dt_col:
         raise ValueError("Legacy Transaction Detail columns were not recognized.")
 
@@ -268,40 +283,64 @@ def profile_legacy_transaction_detail(path: str) -> LargeCSVProfile:
         _col_expr(run_col, "run"),
         _col_expr(trip_col, "trip"),
         _col_expr(bus_col, "bus"),
+        _col_expr(driver_col, "driver"),
         _col_expr(key_col, "key_raw"),
         _col_expr(ttp_col, "ttp_raw"),
-        _col_expr(amount_col, "amount_charged", numeric=True),
     ])
 
     con = _connect()
     try:
-        con.execute(f"CREATE TEMP VIEW raw AS SELECT {select} FROM {_read_csv_expr(path, skip=header_row)}")
-        # Date-time filter removes Search Criteria/footer rows from the report export.
-        con.execute("""
+        con.execute(f"CREATE TEMP VIEW raw0 AS SELECT {select} FROM {_read_csv_expr(path, skip=header_row)}")
+        con.execute(f"""
             CREATE TEMP VIEW src AS
-            SELECT * FROM raw
-            WHERE regexp_matches(transaction_time, '^[0-9]{1,2}/[0-9]{1,2}/[0-9]{4}|^[0-9]{4}-[0-9]{2}-[0-9]{2}')
+            SELECT *, {_date_expr()} AS date, {_timestamp_expr()} AS timestamp
+            FROM raw0
+            WHERE regexp_matches(transaction_time, '^[0-9]{{1,2}}/[0-9]{{1,2}}/[0-9]{{4}}|^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}')
         """)
-        total = con.execute('SELECT COUNT(*) AS "rows", SUM(amount_charged) AS amount_charged FROM src').fetchdf().iloc[0].to_dict()
+        total = con.execute('SELECT COUNT(*) AS "rows" FROM src').fetchdf().iloc[0].to_dict()
+
         agg = con.execute("""
-            SELECT transaction_type, product, route, run, trip, bus, key_raw, ttp_raw,
-                   COUNT(*) event_count, SUM(amount_charged) amount_charged
-            FROM src
-            GROUP BY ALL
+            SELECT transaction_type, product, route, run, trip, bus, driver, key_raw, ttp_raw,
+                   COUNT(*) event_count
+            FROM src GROUP BY ALL
         """).fetchdf()
+        day_raw = con.execute("""
+            SELECT date, transaction_type, product, key_raw, ttp_raw, COUNT(*) event_count
+            FROM src WHERE date <> '' GROUP BY ALL
+        """).fetchdf()
+        day_route_raw = con.execute("""
+            SELECT date, route, transaction_type, product, key_raw, ttp_raw, COUNT(*) event_count
+            FROM src WHERE date <> '' GROUP BY ALL
+        """).fetchdf()
+        day_detail_raw = con.execute("""
+            SELECT date, route, run, bus, transaction_type, product, key_raw, ttp_raw, COUNT(*) event_count
+            FROM src WHERE date <> '' GROUP BY ALL
+        """).fetchdf()
+        sig_raw = pd.DataFrame()
     finally:
         con.close()
 
+    def canon(frame: pd.DataFrame) -> pd.DataFrame:
+        return _canonicalize_aggregates(frame, key_col=None, key_raw_col="key_raw", ttp_raw_col="ttp_raw")
+
     if agg.empty:
-        ident = pd.DataFrame(columns=["identifier", "event_count", "amount_charged"])
+        ident = pd.DataFrame(columns=["identifier", "event_count"])
         route_ident = pd.DataFrame(columns=["route", "identifier", "event_count"])
         runtrip_ident = pd.DataFrame(columns=["route", "run", "trip", "identifier", "event_count"])
     else:
-        agg = _canonicalize_aggregates(agg, key_col=None, key_raw_col="key_raw", ttp_raw_col="ttp_raw")
-        agg = agg[agg["identifier"].ne("")].copy()
-        ident = agg.groupby("identifier", as_index=False).agg(event_count=("event_count", "sum"), amount_charged=("amount_charged", "sum"))
-        route_ident = agg.groupby(["route", "identifier"], as_index=False).agg(event_count=("event_count", "sum"))
-        runtrip_ident = agg.groupby(["route", "run", "trip", "identifier"], as_index=False).agg(event_count=("event_count", "sum"))
+        agg = canon(agg)
+        ident = _group_identifier(agg, [], False)
+        route_ident = _group_identifier(agg, ["route"], False)
+        runtrip_ident = _group_identifier(agg, ["route", "run", "trip"], False)
+
+    day_identifier = _group_identifier(canon(day_raw), ["date"], False) if not day_raw.empty else pd.DataFrame(columns=["date", "identifier", "event_count"])
+    day_route_identifier = _group_identifier(canon(day_route_raw), ["date", "route"], False) if not day_route_raw.empty else pd.DataFrame(columns=["date", "route", "identifier", "event_count"])
+    day_route_run_bus_identifier = _group_identifier(canon(day_detail_raw), ["date", "route", "run", "bus"], False) if not day_detail_raw.empty else pd.DataFrame(columns=["date", "route", "run", "bus", "identifier", "event_count"])
+    transaction_signatures = _group_identifier(canon(sig_raw), ["date", "timestamp", "bus", "driver", "route", "run", "trip"], False) if not sig_raw.empty else pd.DataFrame(columns=["date", "timestamp", "bus", "driver", "route", "run", "trip", "identifier", "event_count"])
+
+    day_summary = pd.DataFrame(columns=["date", "event_count"])
+    if not day_identifier.empty:
+        day_summary = day_identifier.groupby("date", as_index=False)["event_count"].sum()
 
     return LargeCSVProfile(
         kind="LEGACY_TRANSACTION_DETAIL",
@@ -310,6 +349,11 @@ def profile_legacy_transaction_detail(path: str) -> LargeCSVProfile:
         identifier_summary=ident,
         route_identifier=route_ident,
         route_run_trip_identifier=runtrip_ident,
+        day_summary=day_summary,
+        day_identifier=day_identifier,
+        day_route_identifier=day_route_identifier,
+        day_route_run_bus_identifier=day_route_run_bus_identifier,
+        transaction_signatures=transaction_signatures,
         metadata={"header_row": str(header_row + 1), "engine": "DuckDB streaming/aggregate scan"},
         confidence=100,
     )
