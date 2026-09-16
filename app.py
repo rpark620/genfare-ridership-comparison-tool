@@ -188,17 +188,100 @@ def _render_day_drilldown(
     txm: pd.DataFrame,
     has_legacy_tx: bool,
 ):
-    """Interactive drill-down that reruns independently from the rest of the app."""
+    """Compact day cards across the page with one shared detail panel below."""
     st.divider()
     st.markdown("## By day")
-    st.caption("Dates are stacked vertically. Open a day only when you want the deeper Key/TTP → route/run/bus → transaction investigation.")
+    st.caption("Each date is a compact column. Select one day to open its full investigation below the row.")
 
     if day is None or day.empty:
         st.info("Daily reconciliation is unavailable. Upload Legacy Transaction Detail or a ROUTESUM by route-date report.")
         return
 
-    for _, drow in day.iterrows():
+    # Keep one selected day at a time. Widget interaction reruns only this fragment,
+    # so the overall reconciliation above remains visible and does not rerun.
+    selected_key = "selected_day_v4_3"
+    valid_dates = day["Date"].astype(str).tolist()
+    selected_date = st.session_state.get(selected_key)
+    if selected_date not in valid_dates:
+        selected_date = None
+        st.session_state[selected_key] = None
+
+    def _select_day(date: str):
+        current = st.session_state.get(selected_key)
+        st.session_state[selected_key] = None if current == date else date
+
+    # One horizontal row of date cards. For normal report windows (roughly a week),
+    # this keeps every day visible at once instead of stacking large cards vertically.
+    day_columns = st.columns(len(day), gap="small")
+
+    for col, (_, drow) in zip(day_columns, day.iterrows()):
         date = str(drow["Date"])
+        try:
+            dt = pd.to_datetime(date)
+            date_heading = dt.strftime("%b %d").replace(" 0", " ")
+        except Exception:
+            date_heading = date
+
+        legacy_value = drow.get("Legacy Ridership")
+        gfl_raw = drow.get("GFL Raw Ridership")
+        gfl_norm = drow.get("GFL Normalized Ridership")
+        raw_day_diff = drow.get("Raw Difference")
+        norm_day_diff = drow.get("Normalized Difference")
+        authoritative = bool(drow.get("Legacy Daily Authoritative", False))
+        status = str(drow.get("Status", ""))
+        is_selected = st.session_state.get(selected_key) == date
+
+        with col:
+            with st.container(border=True):
+                st.markdown(f"### {date_heading}")
+
+                st.markdown("**Legacy**")
+                st.metric("Ridership", _fmt_num(legacy_value))
+
+                st.markdown("**GenfareLink**")
+                st.metric("Raw", _fmt_num(gfl_raw))
+                st.metric("Adjusted", _fmt_num(gfl_norm))
+
+                st.markdown("**Difference**")
+                first_label = "Raw" if authoritative else "Derived"
+                st.metric(first_label, _fmt_diff(raw_day_diff))
+                st.metric("Adjusted", _fmt_diff(norm_day_diff))
+
+                if status == "Reconciled after behavior normalization" or (not pd.isna(norm_day_diff) and abs(float(norm_day_diff)) < 1e-9):
+                    st.caption("✅ Reconciled")
+                elif status == "Raw match":
+                    st.caption("✅ Raw match")
+                elif status == "Legacy daily total unavailable":
+                    st.caption("ℹ️ Daily total unavailable")
+                else:
+                    st.caption("⚠️ Needs drill-down")
+
+                st.button(
+                    "Close" if is_selected else "Open",
+                    key=f"select_day_{date}",
+                    on_click=_select_day,
+                    args=(date,),
+                    use_container_width=True,
+                    type="primary" if is_selected else "secondary",
+                )
+
+    selected_date = st.session_state.get(selected_key)
+    if not selected_date:
+        st.info("Select **Open** under a date to display its detailed drill-down here.")
+        return
+
+    dmatch = day[day["Date"].astype(str) == str(selected_date)]
+    if dmatch.empty:
+        return
+    drow = dmatch.iloc[0]
+    try:
+        detail_heading = pd.to_datetime(selected_date).strftime("%B %d, %Y").replace(" 0", " ")
+    except Exception:
+        detail_heading = str(selected_date)
+
+    with st.container(border=True):
+        st.markdown(f"## {detail_heading} drill-down")
+
         legacy_value = drow.get("Legacy Ridership")
         gfl_raw = drow.get("GFL Raw Ridership")
         gfl_norm = drow.get("GFL Normalized Ridership")
@@ -206,139 +289,122 @@ def _render_day_drilldown(
         norm_day_diff = drow.get("Normalized Difference")
         authoritative = bool(drow.get("Legacy Daily Authoritative", False))
         source = str(drow.get("Legacy Source", ""))
-        status = str(drow.get("Status", ""))
 
-        with st.container(border=True):
-            st.markdown(f"### {date}")
-            legacy_col, gfl_col, diff_col = st.columns(3)
+        # Compact summary across the full width before deeper evidence.
+        legacy_col, gfl_col, diff_col = st.columns(3)
+        with legacy_col:
+            st.markdown("**Legacy**")
+            st.metric("Ridership", _fmt_num(legacy_value))
+            st.caption(("Authoritative daily total" if authoritative else "Derived daily total") + f" · {source}")
+        with gfl_col:
+            st.markdown("**GenfareLink**")
+            g1, g2 = st.columns(2)
+            g1.metric("Raw ridership", _fmt_num(gfl_raw))
+            g2.metric("After Legacy behavior", _fmt_num(gfl_norm))
+        with diff_col:
+            st.markdown("**Difference**")
+            d1, d2 = st.columns(2)
+            d1.metric("Raw" if authoritative else "Derived", _fmt_diff(raw_day_diff))
+            d2.metric("After behavior", _fmt_diff(norm_day_diff))
 
-            with legacy_col:
-                st.markdown("**Legacy**")
-                st.metric("Ridership", _fmt_num(legacy_value))
-                st.caption(("Authoritative daily total" if authoritative else "Derived daily total") + f" · {source}")
+        date = str(selected_date)
+        current = day_ident[day_ident["Date"].astype(str) == date].copy() if day_ident is not None and not day_ident.empty else pd.DataFrame()
 
-            with gfl_col:
-                st.markdown("**GenfareLink**")
-                gg1, gg2 = st.columns(2)
-                gg1.metric("Raw ridership", _fmt_num(gfl_raw))
-                gg2.metric("After Legacy behavior", _fmt_num(gfl_norm))
+        st.markdown("### Fare categories")
+        if current.empty:
+            st.info("No day-level Key/TTP comparison is available. Legacy Transaction Detail is required for this view.")
+            selected_identifier = None
+        else:
+            rider_diff = pd.to_numeric(current["Rider Difference"], errors="coerce").fillna(0)
+            problems = current[(rider_diff.abs() > 1e-9) | current["Likely Cause"].str.contains("inconsistency|unresolved|difference", case=False, na=False)].copy()
 
-            with diff_col:
-                st.markdown("**Difference**")
-                dd1, dd2 = st.columns(2)
-                first_label = "Raw" if authoritative else "Derived"
-                dd1.metric(first_label, _fmt_diff(raw_day_diff))
-                dd2.metric("After behavior", _fmt_diff(norm_day_diff))
-                if not authoritative:
-                    st.caption("Legacy daily ridership is reconstructed from fare-use transactions; ROUTESUM remains the authoritative period total.")
+            ptab, ktab, ttab, atab = st.tabs(["Problems", "Keys", "TTPs", "All categories"])
+            with ptab:
+                if problems.empty:
+                    st.success("No fare-category rider problems for this day.")
+                else:
+                    st.dataframe(_key_ttp_display(problems), use_container_width=True, hide_index=True)
+            with ktab:
+                st.dataframe(_key_ttp_display(current[current["Type"] == "Key"]), use_container_width=True, hide_index=True)
+            with ttab:
+                st.dataframe(_key_ttp_display(current[current["Type"] == "TTP"]), use_container_width=True, hide_index=True)
+            with atab:
+                st.dataframe(_key_ttp_display(current), use_container_width=True, hide_index=True)
 
-            if status == "Reconciled after behavior normalization" or (not pd.isna(norm_day_diff) and abs(float(norm_day_diff)) < 1e-9):
-                st.success("This day reconciles after fare-category behavior is aligned.")
-            elif status == "Raw match":
-                st.success("This day matches before any behavior adjustment.")
-            elif status == "Legacy daily total unavailable":
-                st.info("No comparable Legacy daily ridership total is available for this date.")
+            candidates = problems["Identifier"].astype(str).tolist() if not problems.empty else current["Identifier"].astype(str).tolist()
+            candidates = list(dict.fromkeys(candidates))
+            selected_identifier = None
+            if candidates:
+                selected_identifier = st.selectbox("Trace one category deeper", candidates, key=f"identifier_{date}")
+                crow = current[current["Identifier"].astype(str) == str(selected_identifier)]
+                if not crow.empty:
+                    r = crow.iloc[0]
+                    _summary_box(
+                        selected_identifier,
+                        str(r["Likely Cause"]),
+                        str(r["Evidence"]),
+                        "success" if str(r["Likely Cause"]) == "Match" else "warning",
+                    )
+
+        st.markdown("### Where it moved")
+
+        def filt(df: pd.DataFrame) -> pd.DataFrame:
+            if df is None or df.empty:
+                return pd.DataFrame()
+            x = df[df["Date"].astype(str) == date].copy() if "Date" in df.columns else df.copy()
+            if selected_identifier is not None and "Identifier" in x.columns:
+                x = x[x["Identifier"].astype(str) == str(selected_identifier)]
+            return x
+
+        rtab, runtab, bustab, movetab, exacttab = st.tabs(["Routes", "Runs", "Buses", "Equal & opposite", "Route + Run + Bus"])
+        with rtab:
+            x = _problem_only(filt(route_cmp))
+            if x.empty:
+                st.success("No route-level rider movement for the current selection.")
             else:
-                st.warning("This day still has an unexplained ridership difference. Open the drill-down to locate it.")
+                st.dataframe(_location_display(x), use_container_width=True, hide_index=True)
+        with runtab:
+            x = _problem_only(filt(run_cmp))
+            if x.empty:
+                st.success("No run-level rider movement for the current selection.")
+            else:
+                st.dataframe(_location_display(x), use_container_width=True, hide_index=True)
+        with bustab:
+            x = _problem_only(filt(bus_cmp))
+            if x.empty:
+                st.success("No bus-level rider movement for the current selection.")
+            else:
+                st.dataframe(_location_display(x), use_container_width=True, hide_index=True)
+        with movetab:
+            x = filt(movements)
+            if x.empty:
+                st.info("No exact equal-and-opposite movement was detected for the current day/category.")
+            else:
+                st.dataframe(_movement_display(x), use_container_width=True, hide_index=True)
+                for _, r in x.head(5).iterrows():
+                    st.info(f"**{r['Likely Cause']}** — {r['Evidence']} (evidence score {int(r['Confidence %'])}%)")
+        with exacttab:
+            x = _problem_only(filt(exact_cmp))
+            if x.empty:
+                st.success("No Route + Run + Bus rider difference for the current selection.")
+            else:
+                st.dataframe(_location_display(x), use_container_width=True, hide_index=True)
 
-            if st.toggle("Open day drill-down", key=f"open_day_{date}"):
-                current = day_ident[day_ident["Date"].astype(str) == date].copy() if day_ident is not None and not day_ident.empty else pd.DataFrame()
-
-                st.markdown("#### Fare categories")
-                if current.empty:
-                    st.info("No day-level Key/TTP comparison is available. Legacy Transaction Detail is required for this view.")
-                    selected_identifier = None
-                else:
-                    rider_diff = pd.to_numeric(current["Rider Difference"], errors="coerce").fillna(0)
-                    problems = current[(rider_diff.abs() > 1e-9) | current["Likely Cause"].str.contains("inconsistency|unresolved|difference", case=False, na=False)].copy()
-
-                    ptab, ktab, ttab, atab = st.tabs(["Problems", "Keys", "TTPs", "All categories"])
-                    with ptab:
-                        if problems.empty:
-                            st.success("No fare-category rider problems for this day.")
-                        else:
-                            st.dataframe(_key_ttp_display(problems), use_container_width=True, hide_index=True)
-                    with ktab:
-                        st.dataframe(_key_ttp_display(current[current["Type"] == "Key"]), use_container_width=True, hide_index=True)
-                    with ttab:
-                        st.dataframe(_key_ttp_display(current[current["Type"] == "TTP"]), use_container_width=True, hide_index=True)
-                    with atab:
-                        st.dataframe(_key_ttp_display(current), use_container_width=True, hide_index=True)
-
-                    candidates = problems["Identifier"].astype(str).tolist() if not problems.empty else current["Identifier"].astype(str).tolist()
-                    candidates = list(dict.fromkeys(candidates))
-                    selected_identifier = None
-                    if candidates:
-                        selected_identifier = st.selectbox("Trace one category deeper", candidates, key=f"identifier_{date}")
-                        crow = current[current["Identifier"].astype(str) == str(selected_identifier)]
-                        if not crow.empty:
-                            r = crow.iloc[0]
-                            _summary_box(
-                                selected_identifier,
-                                str(r["Likely Cause"]),
-                                str(r["Evidence"]),
-                                "success" if str(r["Likely Cause"]) == "Match" else "warning",
-                            )
-
-                st.markdown("#### Where it moved")
-
-                def filt(df: pd.DataFrame) -> pd.DataFrame:
-                    if df is None or df.empty:
-                        return pd.DataFrame()
-                    x = df[df["Date"].astype(str) == date].copy() if "Date" in df.columns else df.copy()
-                    if selected_identifier is not None and "Identifier" in x.columns:
-                        x = x[x["Identifier"].astype(str) == str(selected_identifier)]
-                    return x
-
-                rtab, runtab, bustab, movetab, exacttab = st.tabs(["Routes", "Runs", "Buses", "Equal & opposite", "Route + Run + Bus"])
-                with rtab:
-                    x = _problem_only(filt(route_cmp))
-                    if x.empty:
-                        st.success("No route-level rider movement for the current selection.")
-                    else:
-                        st.dataframe(_location_display(x), use_container_width=True, hide_index=True)
-                with runtab:
-                    x = _problem_only(filt(run_cmp))
-                    if x.empty:
-                        st.success("No run-level rider movement for the current selection.")
-                    else:
-                        st.dataframe(_location_display(x), use_container_width=True, hide_index=True)
-                with bustab:
-                    x = _problem_only(filt(bus_cmp))
-                    if x.empty:
-                        st.success("No bus-level rider movement for the current selection.")
-                    else:
-                        st.dataframe(_location_display(x), use_container_width=True, hide_index=True)
-                with movetab:
-                    x = filt(movements)
-                    if x.empty:
-                        st.info("No exact equal-and-opposite movement was detected for the current day/category.")
-                    else:
-                        st.dataframe(_movement_display(x), use_container_width=True, hide_index=True)
-                        for _, r in x.head(5).iterrows():
-                            st.info(f"**{r['Likely Cause']}** — {r['Evidence']} (evidence score {int(r['Confidence %'])}%)")
-                with exacttab:
-                    x = _problem_only(filt(exact_cmp))
-                    if x.empty:
-                        st.success("No Route + Run + Bus rider difference for the current selection.")
-                    else:
-                        st.dataframe(_location_display(x), use_container_width=True, hide_index=True)
-
-                st.markdown("#### Transaction match")
-                if not has_legacy_tx:
-                    st.info("Upload Legacy Transaction Detail to enable transaction matching.")
-                elif txm is None or txm.empty:
-                    st.success("No remaining transaction-signature discrepancy was identified by the targeted matcher.")
-                else:
-                    txview = txm[txm["Date"].astype(str) == date].copy()
-                    if selected_identifier is not None:
-                        txview = txview[txview["Identifier"].astype(str) == str(selected_identifier)]
-                    if txview.empty:
-                        st.success("No remaining transaction mismatch for the current day/category.")
-                    else:
-                        st.dataframe(_tx_display(txview), use_container_width=True, hide_index=True)
-                        top = txview.iloc[0]
-                        _summary_box("Most specific remaining issue", str(top["Likely Cause"]), str(top["Evidence"]), "warning")
+        st.markdown("### Transaction match")
+        if not has_legacy_tx:
+            st.info("Upload Legacy Transaction Detail to enable transaction matching.")
+        elif txm is None or txm.empty:
+            st.success("No remaining transaction-signature discrepancy was identified by the targeted matcher.")
+        else:
+            txview = txm[txm["Date"].astype(str) == date].copy()
+            if selected_identifier is not None:
+                txview = txview[txview["Identifier"].astype(str) == str(selected_identifier)]
+            if txview.empty:
+                st.success("No remaining transaction mismatch for the current day/category.")
+            else:
+                st.dataframe(_tx_display(txview), use_container_width=True, hide_index=True)
+                top = txview.iloc[0]
+                _summary_box("Most specific remaining issue", str(top["Likely Cause"]), str(top["Evidence"]), "warning")
 
 def _build_payload():
     missing = []
@@ -402,16 +468,16 @@ if run:
     try:
         payload = _build_payload()
         if payload is not None:
-            st.session_state["reconciliation_payload_v4_2"] = payload
+            st.session_state["reconciliation_payload_v4_3"] = payload
             # Close any day drill-downs from the previous reconciliation.
             for key in list(st.session_state.keys()):
-                if str(key).startswith("open_day_") or str(key).startswith("identifier_"):
-                    if key != "reconciliation_payload_v4_2":
+                if str(key).startswith("open_day_") or str(key).startswith("select_day_") or str(key).startswith("identifier_") or str(key) == "selected_day_v4_3":
+                    if key != "reconciliation_payload_v4_3":
                         del st.session_state[key]
     except Exception as exc:
         st.exception(exc)
 
-payload = st.session_state.get("reconciliation_payload_v4_2")
+payload = st.session_state.get("reconciliation_payload_v4_3")
 if payload is not None:
     result = payload["result"]
     diagnostics_df = payload["diagnostics_df"]
@@ -493,7 +559,7 @@ if payload is not None:
         st.download_button(
             "Download summary CSV",
             data=to_csv_bytes(f),
-            file_name="ridership_reconciliation_summary_v4_2.csv",
+            file_name="ridership_reconciliation_summary_v4_3.csv",
             mime="text/csv",
             use_container_width=True,
         )
@@ -501,7 +567,7 @@ if payload is not None:
         st.download_button(
             "Download full drill-down Excel",
             data=to_excel_bytes(result, diagnostics_df),
-            file_name="ridership_reconciliation_full_v4_2.xlsx",
+            file_name="ridership_reconciliation_full_v4_3.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )
@@ -513,7 +579,7 @@ if payload is not None:
         st.download_button(
             "Download AI evidence JSON",
             data=to_ai_json_bytes(result, diagnostics_df),
-            file_name="ridership_ai_evidence_v4_2.json",
+            file_name="ridership_ai_evidence_v4_3.json",
             mime="application/json",
             use_container_width=True,
         )
@@ -521,7 +587,7 @@ if payload is not None:
         st.download_button(
             "Download AI review prompt",
             data=to_ai_prompt_bytes(),
-            file_name="ridership_ai_review_prompt_v4_2.md",
+            file_name="ridership_ai_review_prompt_v4_3.md",
             mime="text/markdown",
             use_container_width=True,
         )
