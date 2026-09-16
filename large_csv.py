@@ -122,7 +122,7 @@ def profile_gfl_ridership(path: str) -> LargeCSVProfile:
     try:
         con.execute(f"CREATE TEMP VIEW src AS SELECT {select} FROM {_read_csv_expr(path)}")
         totals = con.execute("""
-            SELECT COUNT(*) rows,
+            SELECT COUNT(*) AS "rows",
                    SUM(ridership) ridership,
                    SUM(amount_charged) amount_charged
             FROM src
@@ -226,7 +226,7 @@ def profile_gfl_revenue(path: str) -> LargeCSVProfile:
     con = _connect()
     try:
         con.execute(f"CREATE TEMP VIEW src AS SELECT {select} FROM {_read_csv_expr(path)}")
-        total = con.execute("SELECT COUNT(*) rows, SUM(revenue) revenue FROM src").fetchdf().iloc[0].to_dict()
+        total = con.execute('SELECT COUNT(*) AS "rows", SUM(revenue) AS revenue FROM src').fetchdf().iloc[0].to_dict()
         route = con.execute("SELECT route, SUM(revenue) revenue FROM src GROUP BY route").fetchdf()
         rt = con.execute("SELECT route, run, trip, SUM(revenue) revenue FROM src GROUP BY ALL").fetchdf()
         for df in [route, rt]:
@@ -282,7 +282,7 @@ def profile_legacy_transaction_detail(path: str) -> LargeCSVProfile:
             SELECT * FROM raw
             WHERE regexp_matches(transaction_time, '^[0-9]{1,2}/[0-9]{1,2}/[0-9]{4}|^[0-9]{4}-[0-9]{2}-[0-9]{2}')
         """)
-        total = con.execute("SELECT COUNT(*) rows, SUM(amount_charged) amount_charged FROM src").fetchdf().iloc[0].to_dict()
+        total = con.execute('SELECT COUNT(*) AS "rows", SUM(amount_charged) AS amount_charged FROM src').fetchdf().iloc[0].to_dict()
         agg = con.execute("""
             SELECT transaction_type, product, route, run, trip, bus, key_raw, ttp_raw,
                    COUNT(*) event_count, SUM(amount_charged) amount_charged
