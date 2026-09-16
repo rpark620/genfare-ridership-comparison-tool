@@ -1,79 +1,57 @@
-# Genfare Ridership Reconciler V4.4
+# Genfare Report Reconciler V5
 
-Ridership-only Legacy vs GenfareLink reconciliation with a vertical, day-first investigation interface.
+One Railway-hosted Streamlit application with two top-level workflows:
 
-## What changed in V4.4
+- **Ridership** — the V4.4 drill-down workflow, including automatic Legacy ridership-behavior inference, daily comparison, Key/TTP investigation, route/run/bus movement analysis, targeted transaction matching, and external-AI evidence export.
+- **Revenue** — a new revenue reconciliation workflow using authoritative Legacy ROUTESUM revenue and the dedicated GenfareLink Revenue raw-data export.
 
-- Day drill-down controls now run inside a Streamlit fragment. Changing a toggle, Key/TTP dropdown, or drill-down selection refreshes only the investigation area instead of rerunning/resetting the whole app. The upload area and overall reconciliation stay on screen.
+## Revenue source-of-truth rules
 
-- Removed numbered investigation sections from the main UI.
-- Replaced the wide day table with vertically stacked date cards.
-- Each date shows grouped **Legacy**, **GenfareLink**, and **Difference** metrics.
-- Open any day to reveal the deeper investigation for that day only.
-- Key/TTP tables use grouped headers so Legacy and GFL fields stay together.
-- Route/run/bus tables use the same grouped presentation.
-- Daily Legacy reconstruction now uses fare-use / boarding-candidate transaction types instead of counting issuance/admin transactions as riders.
-- Targeted transaction matching also excludes Legacy issuance/admin rows.
-- Derived daily values are explicitly labeled as derived; ROUTESUM remains the authoritative period total unless a ROUTESUM by route-date report supplies authoritative daily totals.
+The Revenue tab intentionally separates authoritative accounting totals from investigative evidence:
 
-## Reports
+1. **Legacy authoritative revenue:** `Current Revenue + Unclassified Revenue` from GDS Legacy Event Summary / ROUTESUM.
+2. **GenfareLink authoritative revenue:** the dedicated GFL **Revenue** raw-data export.
+3. **Legacy Transaction Detail `Amt Chrg`:** investigative only. It is useful for product/run/bus and transaction evidence, but it is not assumed to sum to ROUTESUM revenue.
 
-Required:
+A **BY ROUTE-DATE** ROUTESUM is strongly preferred for Revenue because it provides authoritative Legacy daily revenue and route revenue by day. A plain BY ROUTE report still supports overall and period-level route reconciliation.
 
-1. Genfare Link Raw Data CSV *(Ridership tab)*
-2. Legacy EVENT SUMMARY / ROUTESUM (PDF preferred)
+## Uploads
 
-Strongly recommended:
+### Ridership
 
-3. GDS Legacy Transaction Detail *(Transaction Report > Transaction Detail Report)*
+- **Genfare Link Raw Data** *(Ridership tab)* — required.
+- **GDS Legacy Event Summary Data** *(Event Report > RouteSum Report)* — required.
+- **GDS Legacy Transaction Detail** *(Transaction Report > Transaction Detail Report)* — strongly recommended.
 
-Revenue is intentionally excluded.
+### Revenue
 
-## Investigation flow
+- **Genfare Link Raw Data** *(Revenue tab)* — required.
+- **GDS Legacy Event Summary Data** *(Event Report > RouteSum Report)* — required; BY ROUTE-DATE preferred.
+- **GDS Legacy Transaction Detail** *(Transaction Report > Transaction Detail Report)* — strongly recommended for investigation only.
 
-The app first displays the overall Legacy/GFL totals. Dates then appear vertically. Each date card shows Legacy, GFL, and differences in separate grouped columns. Opening a day reveals:
+## Revenue drill-down
 
-- fare-category problems, Keys, TTPs, and all categories;
-- route, run, bus, and exact route+run+bus differences;
-- equal-and-opposite movement detection;
-- targeted transaction matching for unresolved rider categories.
+The Revenue tab follows the same interaction pattern as Ridership:
 
-## Large-file design
+1. Overall Legacy vs GFL revenue.
+2. Compact date cards across the page; more than six days get a dedicated horizontal scroll strip.
+3. Open one date to show its full-width drill-down below the cards.
+4. Authoritative route comparison when daily ROUTESUM data is available.
+5. Product, run, bus, and Route+Run+Bus investigative evidence from Legacy Transaction Detail.
+6. Equal-and-opposite authoritative route movements to flag likely allocation/Data Edit behavior.
+7. Targeted transaction signature matching on authoritative problem days.
+8. CSV, Excel, AI-evidence JSON, and AI-review-prompt downloads.
 
-DuckDB performs the main CSV scans and aggregations so large raw exports do not need to be loaded into pandas in full. Transaction matching performs a second targeted scan only for discrepant day/category combinations.
+## Railway deployment
 
-## Railway
+This remains a Streamlit application hosted on Railway. Railway runs the included Dockerfile.
 
-The project includes `Dockerfile` and `railway.toml` for Railway deployment.
+Push the V5 files to the existing GitHub repository and Railway should redeploy automatically.
 
-Typical deploy flow:
+The included Railway start command is effectively:
 
 ```bash
-git add .
-git commit -m "Update ridership reconciler V4.4"
-git push
+streamlit run app.py --server.address=0.0.0.0 --server.port=${PORT:-8501}
 ```
 
-If the Railway service is linked to the GitHub repository, it should redeploy automatically.
-
-## Streamlit
-
-The app can still run on Streamlit Community Cloud for smaller tests. Railway is preferable when testing larger multi-day transaction files or when you want more control over CPU/RAM.
-
-## External AI review
-
-No AI agent runs inside the app. The app exports a structured JSON evidence package and a review prompt that can be uploaded to an external AI for interpretation. The deterministic reconciliation engine remains the source of truth for arithmetic.
-
-
-## V4.4 day layout
-
-- Dates are displayed side-by-side as compact columns so a normal weekly comparison fits in one view.
-- Each date card keeps Legacy, GenfareLink, and Difference values grouped vertically.
-- Only one day is opened at a time. Its full Key/TTP -> route/run/bus -> transaction drill-down renders in one full-width panel below all date cards.
-- Selecting a different day or fare category reruns only the drill-down fragment; the overall reconciliation above remains visible and the raw reports are not reprocessed.
-
-
-## V4.4 UI changes
-- Upload names now match the operator-facing report names and show the GDS navigation path beside each title.
-- Up to six dates share the page width; more than six dates stay on one horizontally scrollable date strip.
-- Drill-down tables are intentionally compact. Long problem/cause/evidence text is rendered below the numeric comparison instead of forcing the table wider than the page.
+No OpenAI/API key is required. AI review is external: the app exports a JSON evidence package and a prompt.
