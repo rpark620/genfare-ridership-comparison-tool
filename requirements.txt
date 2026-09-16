@@ -1,4 +1,4 @@
-streamlit>=1.49
+streamlit>=1.62
 duckdb>=1.3
 pandas>=2.1
 scipy>=1.13

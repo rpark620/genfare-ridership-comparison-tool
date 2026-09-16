@@ -1,8 +1,8 @@
-# Genfare Ridership Reconciler V4.3
+# Genfare Ridership Reconciler V4.4
 
 Ridership-only Legacy vs GenfareLink reconciliation with a vertical, day-first investigation interface.
 
-## What changed in V4.3
+## What changed in V4.4
 
 - Day drill-down controls now run inside a Streamlit fragment. Changing a toggle, Key/TTP dropdown, or drill-down selection refreshes only the investigation area instead of rerunning/resetting the whole app. The upload area and overall reconciliation stay on screen.
 
@@ -20,12 +20,12 @@ Ridership-only Legacy vs GenfareLink reconciliation with a vertical, day-first i
 
 Required:
 
-1. GFL Ridership Raw Data CSV
+1. Genfare Link Raw Data CSV *(Ridership tab)*
 2. Legacy EVENT SUMMARY / ROUTESUM (PDF preferred)
 
 Strongly recommended:
 
-3. Legacy TRANSACTION DETAIL CSV
+3. GDS Legacy Transaction Detail *(Transaction Report > Transaction Detail Report)*
 
 Revenue is intentionally excluded.
 
@@ -50,7 +50,7 @@ Typical deploy flow:
 
 ```bash
 git add .
-git commit -m "Update ridership reconciler V4.3"
+git commit -m "Update ridership reconciler V4.4"
 git push
 ```
 
@@ -65,9 +65,15 @@ The app can still run on Streamlit Community Cloud for smaller tests. Railway is
 No AI agent runs inside the app. The app exports a structured JSON evidence package and a review prompt that can be uploaded to an external AI for interpretation. The deterministic reconciliation engine remains the source of truth for arithmetic.
 
 
-## V4.3 day layout
+## V4.4 day layout
 
 - Dates are displayed side-by-side as compact columns so a normal weekly comparison fits in one view.
 - Each date card keeps Legacy, GenfareLink, and Difference values grouped vertically.
 - Only one day is opened at a time. Its full Key/TTP -> route/run/bus -> transaction drill-down renders in one full-width panel below all date cards.
 - Selecting a different day or fare category reruns only the drill-down fragment; the overall reconciliation above remains visible and the raw reports are not reprocessed.
+
+
+## V4.4 UI changes
+- Upload names now match the operator-facing report names and show the GDS navigation path beside each title.
+- Up to six dates share the page width; more than six dates stay on one horizontally scrollable date strip.
+- Drill-down tables are intentionally compact. Long problem/cause/evidence text is rendered below the numeric comparison instead of forcing the table wider than the page.

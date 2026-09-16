@@ -21,12 +21,12 @@ with st.expander("Upload guidance", expanded=False):
         """
 **Required**
 
-- **GenfareLink Ridership Raw Data CSV** — GFL ridership export with Transaction Time, Ridership, Key/TTP, Route, Run, Bus, and Trip when available.
-- **Legacy EVENT SUMMARY / ROUTESUM** — PDF preferred because it preserves route totals, Key counts, TTP counts, and the Legacy key-ridership display.
+- **Genfare Link Raw Data** *(Ridership tab)* — export the GFL ridership raw-data CSV.
+- **GDS Legacy Event Summary Data** *(Event Report > RouteSum Report)* — PDF preferred because it preserves route totals, Key counts, TTP counts, and the Legacy key-ridership display.
 
 **Strongly recommended**
 
-- **Legacy TRANSACTION DETAIL CSV** — enables daily reconstruction, fare-category comparison, route/run/bus localization, equal-and-opposite movement detection, and targeted transaction matching.
+- **GDS Legacy Transaction Detail** *(Transaction Report > Transaction Detail Report)* — CSV enables daily reconstruction, fare-category comparison, route/run/bus localization, equal-and-opposite movement detection, and targeted transaction matching.
 
 **Scope:** ridership only. Revenue is intentionally excluded.
 """
@@ -34,10 +34,28 @@ with st.expander("Upload guidance", expanded=False):
 
 left, right = st.columns(2)
 with left:
-    gfl_rid_file = st.file_uploader("GFL Ridership Raw Data — required", type=["csv"], key="gflrid")
+    st.markdown("**Genfare Link Raw Data** *(Ridership tab)*")
+    gfl_rid_file = st.file_uploader(
+        "Genfare Link Raw Data (Ridership tab)",
+        type=["csv"],
+        key="gflrid",
+        label_visibility="collapsed",
+    )
 with right:
-    legacy_routesum_file = st.file_uploader("Legacy ROUTESUM — required", type=["pdf", "csv"], key="routesum")
-    legacy_tx_file = st.file_uploader("Legacy Transaction Detail — recommended", type=["csv"], key="legacytx")
+    st.markdown("**GDS Legacy Event Summary Data** *(Event Report > RouteSum Report)*")
+    legacy_routesum_file = st.file_uploader(
+        "GDS Legacy Event Summary Data (Event Report > RouteSum Report)",
+        type=["pdf", "csv"],
+        key="routesum",
+        label_visibility="collapsed",
+    )
+    st.markdown("**GDS Legacy Transaction Detail** *(Transaction Report > Transaction Detail Report)*")
+    legacy_tx_file = st.file_uploader(
+        "GDS Legacy Transaction Detail (Transaction Report > Transaction Detail Report)",
+        type=["csv"],
+        key="legacytx",
+        label_visibility="collapsed",
+    )
 
 run = st.button("Reconcile ridership", type="primary", use_container_width=True)
 
@@ -66,22 +84,20 @@ def _fmt_diff(v) -> str:
 
 
 def _key_ttp_display(df: pd.DataFrame) -> pd.DataFrame:
+    """Compact numeric comparison that stays within the page width.
+
+    Cause/evidence text is rendered below the table instead of as very wide columns.
+    """
     if df is None or df.empty:
         return pd.DataFrame()
     wanted = [
-        ("Category", "Type", "Type"),
         ("Category", "Identifier", "Identifier"),
-        ("Legacy", "Fare-use events", "Legacy Events"),
+        ("Legacy", "Events", "Legacy Events"),
         ("Legacy", "Expected riders", "Legacy Expected Riders"),
-        ("Legacy", "Counts ridership", "Legacy Counts Ridership"),
-        ("GenfareLink", "Ridership records", "GFL Ridership Records"),
+        ("GenfareLink", "Records", "GFL Ridership Records"),
         ("GenfareLink", "Riders", "GFL Riders"),
-        ("GenfareLink", "Riders / record", "GFL Riders/Record"),
         ("Difference", "Records", "Record Difference"),
         ("Difference", "Riders", "Rider Difference"),
-        ("Analysis", "Problem", "Problem Summary"),
-        ("Analysis", "Likely cause", "Likely Cause"),
-        ("Analysis", "Evidence", "Evidence"),
     ]
     data, cols = {}, []
     for group, label, source in wanted:
@@ -93,6 +109,21 @@ def _key_ttp_display(df: pd.DataFrame) -> pd.DataFrame:
     if cols:
         out.columns = pd.MultiIndex.from_tuples(cols)
     return out
+
+
+def _render_problem_summaries(df: pd.DataFrame, max_items: int = 12):
+    """Render long analysis text below compact tables so it never pushes the grid off-screen."""
+    if df is None or df.empty:
+        return
+    st.markdown("**Problem summaries**")
+    for _, r in df.head(max_items).iterrows():
+        ident = str(r.get("Identifier", "Issue"))
+        problem = str(r.get("Problem Summary", ""))
+        cause = str(r.get("Likely Cause", ""))
+        evidence = str(r.get("Evidence", ""))
+        st.markdown(
+            f"**{ident}:** {problem}  \n**Likely cause:** {cause}  \n**Evidence:** {evidence}"
+        )
 
 
 def _location_display(df: pd.DataFrame) -> pd.DataFrame:
@@ -129,9 +160,7 @@ def _movement_display(df: pd.DataFrame) -> pd.DataFrame:
         ("Movement", "Legacy location", "Legacy Location"),
         ("Movement", "GFL location", "GFL Location"),
         ("Movement", "Count", "Count"),
-        ("Analysis", "Likely cause", "Likely Cause"),
-        ("Analysis", "Evidence score", "Confidence %"),
-        ("Analysis", "Evidence", "Evidence"),
+        ("Evidence", "Score", "Confidence %"),
     ]
     data, cols = {}, []
     for group, label, source in wanted:
@@ -153,15 +182,11 @@ def _tx_display(df: pd.DataFrame) -> pd.DataFrame:
         ("Match", "Bus", "Bus"),
         ("Match", "Identifier", "Identifier"),
         ("Legacy", "Count", "Legacy Count"),
-        ("Legacy", "Assignments", "Legacy Assignments"),
         ("GenfareLink", "Riders", "GFL Riders"),
-        ("GenfareLink", "Assignments", "GFL Assignments"),
         ("Difference", "Count", "Count Difference"),
         ("Difference", "Assignment", "Assignment Difference"),
         ("Match", "Exact assignments", "Exact Assignment Matches"),
-        ("Analysis", "Likely cause", "Likely Cause"),
-        ("Analysis", "Evidence score", "Confidence %"),
-        ("Analysis", "Evidence", "Evidence"),
+        ("Evidence", "Score", "Confidence %"),
     ]
     data, cols = {}, []
     for group, label, source in wanted:
@@ -194,12 +219,12 @@ def _render_day_drilldown(
     st.caption("Each date is a compact column. Select one day to open its full investigation below the row.")
 
     if day is None or day.empty:
-        st.info("Daily reconciliation is unavailable. Upload Legacy Transaction Detail or a ROUTESUM by route-date report.")
+        st.info("Daily reconciliation is unavailable. Upload GDS Legacy Transaction Detail or a RouteSum report with daily detail.")
         return
 
     # Keep one selected day at a time. Widget interaction reruns only this fragment,
     # so the overall reconciliation above remains visible and does not rerun.
-    selected_key = "selected_day_v4_3"
+    selected_key = "selected_day_v4_4"
     valid_dates = day["Date"].astype(str).tolist()
     selected_date = st.session_state.get(selected_key)
     if selected_date not in valid_dates:
@@ -210,11 +235,7 @@ def _render_day_drilldown(
         current = st.session_state.get(selected_key)
         st.session_state[selected_key] = None if current == date else date
 
-    # One horizontal row of date cards. For normal report windows (roughly a week),
-    # this keeps every day visible at once instead of stacking large cards vertically.
-    day_columns = st.columns(len(day), gap="small")
-
-    for col, (_, drow) in zip(day_columns, day.iterrows()):
+    def _render_day_card(drow):
         date = str(drow["Date"])
         try:
             dt = pd.to_datetime(date)
@@ -231,39 +252,49 @@ def _render_day_drilldown(
         status = str(drow.get("Status", ""))
         is_selected = st.session_state.get(selected_key) == date
 
-        with col:
-            with st.container(border=True):
-                st.markdown(f"### {date_heading}")
+        st.markdown(f"### {date_heading}")
+        st.markdown("**Legacy**")
+        st.metric("Ridership", _fmt_num(legacy_value))
+        st.markdown("**GenfareLink**")
+        st.metric("Raw", _fmt_num(gfl_raw))
+        st.metric("Adjusted", _fmt_num(gfl_norm))
+        st.markdown("**Difference**")
+        first_label = "Raw" if authoritative else "Derived"
+        st.metric(first_label, _fmt_diff(raw_day_diff))
+        st.metric("Adjusted", _fmt_diff(norm_day_diff))
 
-                st.markdown("**Legacy**")
-                st.metric("Ridership", _fmt_num(legacy_value))
+        if status == "Reconciled after behavior normalization" or (not pd.isna(norm_day_diff) and abs(float(norm_day_diff)) < 1e-9):
+            st.caption("✅ Reconciled")
+        elif status == "Raw match":
+            st.caption("✅ Raw match")
+        elif status == "Legacy daily total unavailable":
+            st.caption("ℹ️ Daily total unavailable")
+        else:
+            st.caption("⚠️ Needs drill-down")
 
-                st.markdown("**GenfareLink**")
-                st.metric("Raw", _fmt_num(gfl_raw))
-                st.metric("Adjusted", _fmt_num(gfl_norm))
+        st.button(
+            "Close" if is_selected else "Open",
+            key=f"select_day_{date}",
+            on_click=_select_day,
+            args=(date,),
+            use_container_width=True,
+            type="primary" if is_selected else "secondary",
+        )
 
-                st.markdown("**Difference**")
-                first_label = "Raw" if authoritative else "Derived"
-                st.metric(first_label, _fmt_diff(raw_day_diff))
-                st.metric("Adjusted", _fmt_diff(norm_day_diff))
-
-                if status == "Reconciled after behavior normalization" or (not pd.isna(norm_day_diff) and abs(float(norm_day_diff)) < 1e-9):
-                    st.caption("✅ Reconciled")
-                elif status == "Raw match":
-                    st.caption("✅ Raw match")
-                elif status == "Legacy daily total unavailable":
-                    st.caption("ℹ️ Daily total unavailable")
-                else:
-                    st.caption("⚠️ Needs drill-down")
-
-                st.button(
-                    "Close" if is_selected else "Open",
-                    key=f"select_day_{date}",
-                    on_click=_select_day,
-                    args=(date,),
-                    use_container_width=True,
-                    type="primary" if is_selected else "secondary",
-                )
+    # Six or fewer dates divide evenly across the page. Larger windows use Streamlit's
+    # native no-wrap horizontal flex container, which gets its own horizontal scrollbar.
+    if len(day) <= 6:
+        day_columns = st.columns(len(day), gap="small")
+        for col, (_, drow) in zip(day_columns, day.iterrows()):
+            with col:
+                with st.container(border=True):
+                    _render_day_card(drow)
+    else:
+        st.caption("Scroll horizontally within the date strip to view additional days.")
+        with st.container(horizontal=True, wrap=False, gap="small", key="day_strip_v4_4"):
+            for _, drow in day.iterrows():
+                with st.container(border=True, width=250):
+                    _render_day_card(drow)
 
     selected_date = st.session_state.get(selected_key)
     if not selected_date:
@@ -312,7 +343,7 @@ def _render_day_drilldown(
 
         st.markdown("### Fare categories")
         if current.empty:
-            st.info("No day-level Key/TTP comparison is available. Legacy Transaction Detail is required for this view.")
+            st.info("No day-level Key/TTP comparison is available. GDS Legacy Transaction Detail is required for this view.")
             selected_identifier = None
         else:
             rider_diff = pd.to_numeric(current["Rider Difference"], errors="coerce").fillna(0)
@@ -323,13 +354,14 @@ def _render_day_drilldown(
                 if problems.empty:
                     st.success("No fare-category rider problems for this day.")
                 else:
-                    st.dataframe(_key_ttp_display(problems), use_container_width=True, hide_index=True)
+                    st.dataframe(_key_ttp_display(problems), width="stretch", hide_index=True)
+                    _render_problem_summaries(problems)
             with ktab:
-                st.dataframe(_key_ttp_display(current[current["Type"] == "Key"]), use_container_width=True, hide_index=True)
+                st.dataframe(_key_ttp_display(current[current["Type"] == "Key"]), width="stretch", hide_index=True)
             with ttab:
-                st.dataframe(_key_ttp_display(current[current["Type"] == "TTP"]), use_container_width=True, hide_index=True)
+                st.dataframe(_key_ttp_display(current[current["Type"] == "TTP"]), width="stretch", hide_index=True)
             with atab:
-                st.dataframe(_key_ttp_display(current), use_container_width=True, hide_index=True)
+                st.dataframe(_key_ttp_display(current), width="stretch", hide_index=True)
 
             candidates = problems["Identifier"].astype(str).tolist() if not problems.empty else current["Identifier"].astype(str).tolist()
             candidates = list(dict.fromkeys(candidates))
@@ -362,25 +394,25 @@ def _render_day_drilldown(
             if x.empty:
                 st.success("No route-level rider movement for the current selection.")
             else:
-                st.dataframe(_location_display(x), use_container_width=True, hide_index=True)
+                st.dataframe(_location_display(x), width="stretch", hide_index=True)
         with runtab:
             x = _problem_only(filt(run_cmp))
             if x.empty:
                 st.success("No run-level rider movement for the current selection.")
             else:
-                st.dataframe(_location_display(x), use_container_width=True, hide_index=True)
+                st.dataframe(_location_display(x), width="stretch", hide_index=True)
         with bustab:
             x = _problem_only(filt(bus_cmp))
             if x.empty:
                 st.success("No bus-level rider movement for the current selection.")
             else:
-                st.dataframe(_location_display(x), use_container_width=True, hide_index=True)
+                st.dataframe(_location_display(x), width="stretch", hide_index=True)
         with movetab:
             x = filt(movements)
             if x.empty:
                 st.info("No exact equal-and-opposite movement was detected for the current day/category.")
             else:
-                st.dataframe(_movement_display(x), use_container_width=True, hide_index=True)
+                st.dataframe(_movement_display(x), width="stretch", hide_index=True)
                 for _, r in x.head(5).iterrows():
                     st.info(f"**{r['Likely Cause']}** — {r['Evidence']} (evidence score {int(r['Confidence %'])}%)")
         with exacttab:
@@ -388,11 +420,11 @@ def _render_day_drilldown(
             if x.empty:
                 st.success("No Route + Run + Bus rider difference for the current selection.")
             else:
-                st.dataframe(_location_display(x), use_container_width=True, hide_index=True)
+                st.dataframe(_location_display(x), width="stretch", hide_index=True)
 
         st.markdown("### Transaction match")
         if not has_legacy_tx:
-            st.info("Upload Legacy Transaction Detail to enable transaction matching.")
+            st.info("Upload GDS Legacy Transaction Detail to enable transaction matching.")
         elif txm is None or txm.empty:
             st.success("No remaining transaction-signature discrepancy was identified by the targeted matcher.")
         else:
@@ -402,16 +434,19 @@ def _render_day_drilldown(
             if txview.empty:
                 st.success("No remaining transaction mismatch for the current day/category.")
             else:
-                st.dataframe(_tx_display(txview), use_container_width=True, hide_index=True)
+                st.dataframe(_tx_display(txview), width="stretch", hide_index=True)
                 top = txview.iloc[0]
                 _summary_box("Most specific remaining issue", str(top["Likely Cause"]), str(top["Evidence"]), "warning")
+                with st.expander("Show assignment details for the top mismatch"):
+                    st.markdown(f"**Legacy assignments:** {top.get('Legacy Assignments', '—')}")
+                    st.markdown(f"**GenfareLink assignments:** {top.get('GFL Assignments', '—')}")
 
 def _build_payload():
     missing = []
     if not gfl_rid_file:
-        missing.append("GFL Ridership Raw Data")
+        missing.append("Genfare Link Raw Data")
     if not legacy_routesum_file:
-        missing.append("Legacy ROUTESUM")
+        missing.append("GDS Legacy Event Summary Data")
     if missing:
         st.error("Please upload: " + ", ".join(missing))
         return None
@@ -436,9 +471,9 @@ def _build_payload():
 
         elapsed = time.perf_counter() - start
         for label, obj, filename in [
-            ("GFL Ridership", gfl, gfl_rid_file.name),
-            ("Legacy ROUTESUM", routesum, legacy_routesum_file.name),
-            ("Legacy Transaction Detail", legacy_tx, legacy_tx_file.name if legacy_tx_file else "Not uploaded"),
+            ("Genfare Link Raw Data", gfl, gfl_rid_file.name),
+            ("GDS Legacy Event Summary Data", routesum, legacy_routesum_file.name),
+            ("GDS Legacy Transaction Detail", legacy_tx, legacy_tx_file.name if legacy_tx_file else "Not uploaded"),
         ]:
             if obj is None:
                 diagnostics.append({"Report": label, "File": filename, "Detected As": "Not uploaded", "Confidence": "—", "Warnings": "Full drill-down unavailable"})
@@ -468,16 +503,16 @@ if run:
     try:
         payload = _build_payload()
         if payload is not None:
-            st.session_state["reconciliation_payload_v4_3"] = payload
+            st.session_state["reconciliation_payload_v4_4"] = payload
             # Close any day drill-downs from the previous reconciliation.
             for key in list(st.session_state.keys()):
-                if str(key).startswith("open_day_") or str(key).startswith("select_day_") or str(key).startswith("identifier_") or str(key) == "selected_day_v4_3":
-                    if key != "reconciliation_payload_v4_3":
+                if str(key).startswith("open_day_") or str(key).startswith("select_day_") or str(key).startswith("identifier_") or str(key) == "selected_day_v4_4":
+                    if key != "reconciliation_payload_v4_4":
                         del st.session_state[key]
     except Exception as exc:
         st.exception(exc)
 
-payload = st.session_state.get("reconciliation_payload_v4_3")
+payload = st.session_state.get("reconciliation_payload_v4_4")
 if payload is not None:
     result = payload["result"]
     diagnostics_df = payload["diagnostics_df"]
@@ -593,5 +628,5 @@ if payload is not None:
         )
 
     with st.expander("Diagnostics"):
-        st.dataframe(diagnostics_df, use_container_width=True, hide_index=True)
+        st.dataframe(diagnostics_df, width="stretch", hide_index=True)
         st.markdown(f"Legacy behavior inference confidence: **{s['rule_confidence']}%**; exact route fit: **{s['rule_exact_fit']}**.")
