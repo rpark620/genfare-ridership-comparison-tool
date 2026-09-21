@@ -238,11 +238,139 @@ def parse_routesum_pdf(file_obj) -> LegacyRouteSum:
     )
 
 
-def parse_routesum_csv(file_obj) -> LegacyRouteSum:
-    rows = list(csv.reader(io.StringIO(_text(_bytes(file_obj)))))
-    section = next((i for i, r in enumerate(rows) if any("Revenue and Ridership By Route" in str(c) for c in r)), None)
+def _section_index(rows, title: str):
+    title_low = title.lower()
+    return next((i for i, r in enumerate(rows) if any(title_low in str(c).strip().lower() for c in r)), None)
+
+
+def _next_header(rows, start: int, required_terms: tuple[str, ...], lookahead: int = 10):
+    req = tuple(x.lower() for x in required_terms)
+    for i in range(start + 1, min(start + 1 + lookahead, len(rows))):
+        cleaned = [str(c).strip().strip('"') for c in rows[i]]
+        joined = " | ".join(cleaned).lower()
+        if all(term in joined for term in req):
+            return i, cleaned
+    return None, []
+
+
+def _to_number(value, default=0.0):
+    try:
+        s = str(value).strip().strip('"').replace(",", "")
+        return float(s) if s else default
+    except Exception:
+        return default
+
+
+def _parse_key_matrix(rows, section_title: str, value_name: str):
+    section = _section_index(rows, section_title)
     if section is None:
-        raise ValueError("Revenue and Ridership By Route section was not found in the Legacy ROUTESUM CSV.")
+        return pd.DataFrame(columns=["route", "identifier", value_name])
+    header_idx, headers = _next_header(rows, section, ("route", "key"), lookahead=8)
+    if header_idx is None:
+        return pd.DataFrame(columns=["route", "identifier", value_name])
+
+    route_i = next((i for i, h in enumerate(headers) if h.strip().lower() == "route"), None)
+    key_cols = []
+    for j, h in enumerate(headers):
+        m = re.match(r"^Key\s+([1-9*ABCD])(?:\s+.*)?$", h.strip(), flags=re.I)
+        if m:
+            key_cols.append((j, f"KEY {m.group(1).upper()}"))
+    if route_i is None or not key_cols:
+        return pd.DataFrame(columns=["route", "identifier", value_name])
+
+    out = []
+    for row in rows[header_idx + 1:]:
+        if not row or not any(str(c).strip() for c in row):
+            if out:
+                break
+            continue
+        first = str(row[0]).strip().strip('"') if row else ""
+        if first.upper() in {"TOTAL", "LOCATION TOTAL", "GRAND TOTAL", "ROUTE TOTAL"}:
+            break
+        if route_i >= len(row):
+            continue
+        route = str(row[route_i]).strip().strip('"')
+        if not re.fullmatch(r"\d+(?:\.0)?", route):
+            continue
+        route = re.sub(r"\.0$", "", route)
+        for j, ident in key_cols:
+            value = _to_number(row[j] if j < len(row) else 0, 0.0)
+            out.append({"route": route, "identifier": ident, value_name: value})
+    df = pd.DataFrame(out) if out else pd.DataFrame(columns=["route", "identifier", value_name])
+    if not df.empty:
+        df = df.groupby(["route", "identifier"], as_index=False)[value_name].sum()
+    return df
+
+
+def _parse_ttp_matrix(rows):
+    section = _section_index(rows, "Token, Ticket, and Pass Count")
+    if section is None:
+        return _empty_long()
+    header_idx, headers = _next_header(rows, section, ("route", "ttp"), lookahead=8)
+    if header_idx is None:
+        return _empty_long()
+
+    route_i = next((i for i, h in enumerate(headers) if h.strip().lower() == "route"), None)
+    ttp_cols = []
+    ttp_names = {}
+    for j, h in enumerate(headers):
+        m = re.match(r"^TTP\s*(\d+)(?:\s+(.*))?$", h.strip(), flags=re.I)
+        if m:
+            ident = f"TTP {int(m.group(1))}"
+            ttp_cols.append((j, ident))
+            label = (m.group(2) or "").strip()
+            if label:
+                ttp_names[ident] = label
+    if route_i is None or not ttp_cols:
+        return _empty_long()
+
+    out = []
+    for row in rows[header_idx + 1:]:
+        if not row or not any(str(c).strip() for c in row):
+            if out:
+                break
+            continue
+        first = str(row[0]).strip().strip('"') if row else ""
+        if first.upper() in {"TOTAL", "LOCATION TOTAL", "GRAND TOTAL", "ROUTE TOTAL"}:
+            break
+        if route_i >= len(row):
+            continue
+        # Some GDS TXT exports leave the Location value unquoted (for example
+        # `1-Scranton, PA`), so csv.reader splits it into two cells and shifts
+        # Route/TTP values one column to the right. Detect that row-level shift.
+        actual_route_i = route_i
+        route = str(row[actual_route_i]).strip().strip('"') if actual_route_i < len(row) else ""
+        if not re.fullmatch(r"\d+(?:\.0)?", route):
+            if route_i + 1 < len(row):
+                shifted = str(row[route_i + 1]).strip().strip('"')
+                if re.fullmatch(r"\d+(?:\.0)?", shifted):
+                    actual_route_i = route_i + 1
+                    route = shifted
+        if not re.fullmatch(r"\d+(?:\.0)?", route):
+            continue
+        shift = actual_route_i - route_i
+        route = re.sub(r"\.0$", "", route)
+        for j, ident in ttp_cols:
+            jj = j + shift
+            value = _to_number(row[jj] if jj < len(row) else 0, 0.0)
+            out.append({"route": route, "identifier": ident, "count": value})
+    df = pd.DataFrame(out) if out else _empty_long()
+    if not df.empty:
+        df = df.groupby(["route", "identifier"], as_index=False)["count"].sum()
+    df.attrs["ttp_names"] = ttp_names
+    return df
+
+
+def parse_routesum_csv(file_obj) -> LegacyRouteSum:
+    """Parse GDS delimited ROUTESUM exports (.csv or .txt).
+
+    GDS TXT exports are CSV-formatted text files. In addition to the summary section,
+    newer TXT exports preserve labeled Key/TTP matrices, so parse those when present.
+    """
+    rows = list(csv.reader(io.StringIO(_text(_bytes(file_obj)))))
+    section = _section_index(rows, "Revenue and Ridership By Route")
+    if section is None:
+        raise ValueError("Revenue and Ridership By Route section was not found in the Legacy ROUTESUM CSV/TXT.")
     header_idx = None
     for i in range(section + 1, min(section + 8, len(rows))):
         cleaned = [str(c).strip().strip('"') for c in rows[i]]
@@ -250,16 +378,19 @@ def parse_routesum_csv(file_obj) -> LegacyRouteSum:
             header_idx = i
             break
     if header_idx is None:
-        raise ValueError("Could not identify the ROUTESUM CSV summary header.")
+        raise ValueError("Could not identify the ROUTESUM CSV/TXT summary header.")
     headers = [str(c).strip().strip('"') for c in rows[header_idx]]
+
     def idx(label):
         return next((j for j, h in enumerate(headers) if h.lower() == label.lower()), None)
+
     route_i, date_i = idx("Route"), idx("Date")
     cur_i, un_i, rid_i = idx("Current Revenue"), idx("Unclassified Revenue"), idx("Ridership")
     preset_i = next((j for j, h in enumerate(headers) if "preset" in h.lower()), None)
     dump_i = next((j for j, h in enumerate(headers) if "dump" in h.lower()), None)
     if route_i is None or cur_i is None or rid_i is None:
-        raise ValueError("ROUTESUM CSV required columns were not recognized.")
+        raise ValueError("ROUTESUM CSV/TXT required columns were not recognized.")
+
     records = []
     for row in rows[header_idx + 1:]:
         if route_i >= len(row):
@@ -269,43 +400,67 @@ def parse_routesum_csv(file_obj) -> LegacyRouteSum:
             break
         if not re.fullmatch(r"\d+(?:\.0)?", r):
             continue
+
         def get(i, default="0"):
             return str(row[i]).strip().strip('"') if i is not None and i < len(row) else default
+
         def num(i):
-            try:
-                return float(get(i).replace(",", ""))
-            except Exception:
-                return 0.0
+            return _to_number(get(i), 0.0)
+
         records.append({
-            "route": re.sub(r"\.0$", "", r), "date": get(date_i, ""),
-            "current_revenue": num(cur_i), "unclassified_revenue": num(un_i),
-            "dump_count": num(dump_i), "preset": num(preset_i), "ridership": num(rid_i),
+            "route": re.sub(r"\.0$", "", r),
+            "date": get(date_i, ""),
+            "current_revenue": num(cur_i),
+            "unclassified_revenue": num(un_i),
+            "dump_count": num(dump_i),
+            "preset": num(preset_i),
+            "ridership": num(rid_i),
         })
+
     route = pd.DataFrame(records)
     route_date = route.copy()
     if not route.empty:
         route = route.groupby("route", as_index=False).agg(
-            current_revenue=("current_revenue", "sum"), unclassified_revenue=("unclassified_revenue", "sum"),
-            dump_count=("dump_count", "sum"), preset=("preset", "sum"), ridership=("ridership", "sum")
+            current_revenue=("current_revenue", "sum"),
+            unclassified_revenue=("unclassified_revenue", "sum"),
+            dump_count=("dump_count", "sum"),
+            preset=("preset", "sum"),
+            ridership=("ridership", "sum"),
         )
+
+    key_counts = _parse_key_matrix(rows, "Key Count By Route", "count")
+    key_display = _parse_key_matrix(rows, "Preset and Key Count with Riderships by Route", "displayed_ridership")
+    ttp_counts = _parse_ttp_matrix(rows)
+
     totals = {
         "ridership": float(route["ridership"].sum()) if not route.empty else 0.0,
         "current_revenue": float(route["current_revenue"].sum()) if not route.empty else 0.0,
         "unclassified_revenue": float(route["unclassified_revenue"].sum()) if not route.empty else 0.0,
     }
     totals["total_revenue"] = totals["current_revenue"] + totals["unclassified_revenue"]
+
+    warnings = []
+    if key_counts.empty:
+        warnings.append("No labeled Key Count By Route matrix was found in this ROUTESUM CSV/TXT; Transaction Detail may be used as fallback evidence.")
+    if ttp_counts.empty:
+        warnings.append("No labeled TTP matrix was found in this ROUTESUM CSV/TXT; Transaction Detail may be used as fallback evidence.")
+    if key_display.empty:
+        warnings.append("No labeled key-ridership display matrix was found; Legacy internal display checks will be limited.")
+
+    ttp_names = getattr(ttp_counts, "attrs", {}).get("ttp_names", {}) if not ttp_counts.empty else {}
+    detail_score = sum(not df.empty for df in (key_counts, key_display, ttp_counts))
     return LegacyRouteSum(
-        kind="LEGACY_ROUTESUM_CSV",
+        kind="LEGACY_ROUTESUM_DELIMITED",
         route_summary=route,
         route_date_summary=route_date,
+        key_counts=key_counts,
+        key_display_ridership=key_display,
+        ttp_counts=ttp_counts,
         totals=totals,
-        warnings=[
-            "ROUTESUM CSV summary totals were parsed, but Legacy CSV TTP/key matrices are not consistently labeled across exports. "
-            "For automatic ridership-rule inference, ROUTESUM PDF is preferred; Transaction Detail CSV can provide fallback evidence."
-        ],
-        confidence=95,
+        metadata={"ttp_names": repr(ttp_names)},
+        warnings=warnings,
+        confidence=98 if detail_score >= 2 else 95,
     )
-
 
 def parse_routesum(file_obj, filename: str = "") -> LegacyRouteSum:
     name = (filename or getattr(file_obj, "name", "") or "").lower()
