@@ -154,7 +154,8 @@ def match_remaining_transactions(gfl_path: str, legacy_path: str, targets: Itera
     """Targeted second-pass transaction matching for only discrepant day/category pairs."""
     targets = {(str(d), str(i)) for d, i in targets if d and i}
     columns = [
-        "Date", "Timestamp", "Bus", "Identifier", "Legacy Count", "GFL Riders",
+        "Date", "Timestamp", "Bus", "Identifier", "Issue Type", "Assignment Kind",
+        "Legacy Count", "GFL Riders", "Missing from GFL", "Extra in GFL",
         "Exact Assignment Matches", "Assignment Difference", "Count Difference",
         "Legacy Assignments", "GFL Assignments", "Likely Cause", "Confidence %", "Evidence",
     ]
@@ -180,29 +181,71 @@ def match_remaining_transactions(gfl_path: str, legacy_path: str, targets: Itera
         for assignment in set(la) | set(ga):
             exact += min(la.get(assignment, 0.0), ga.get(assignment, 0.0))
         count_diff = gt - lt
+        missing_from_gfl = max(0.0, lt - gt)
+        extra_in_gfl = max(0.0, gt - lt)
         assignment_diff = max(0.0, min(lt, gt) - exact)
         if abs(count_diff) < 1e-9 and assignment_diff < 1e-9:
             continue
+
+        def assignment_kind(legacy_assignments, gfl_assignments):
+            if not legacy_assignments or not gfl_assignments:
+                return ""
+            lr = {a[0] for a, c in legacy_assignments.items() if c > 0}
+            gr = {a[0] for a, c in gfl_assignments.items() if c > 0}
+            if lr != gr:
+                return "Route differs"
+            lrun = {a[1] for a, c in legacy_assignments.items() if c > 0}
+            grun = {a[1] for a, c in gfl_assignments.items() if c > 0}
+            if lrun != grun:
+                return "Run differs"
+            ltrip = {a[2] for a, c in legacy_assignments.items() if c > 0}
+            gtrip = {a[2] for a, c in gfl_assignments.items() if c > 0}
+            if ltrip != gtrip:
+                return "Trip differs"
+            ldriver = {a[3] for a, c in legacy_assignments.items() if c > 0}
+            gdriver = {a[3] for a, c in gfl_assignments.items() if c > 0}
+            if ldriver != gdriver:
+                return "Driver differs"
+            return "Assignment differs"
+
+        assign_kind = assignment_kind(la, ga) if assignment_diff > 0 else ""
         if abs(count_diff) < 1e-9 and assignment_diff > 0:
-            cause = "Same transaction signature exists in both systems but route/run/trip assignment differs"
+            issue_type = "Assignment difference"
+            cause = "Same rider signature exists in both systems; route/run/trip assignment differs"
             confidence = 99 if base[1] and base[2] else 95
-        elif lt == 0:
-            cause = "GFL rider has no matching Legacy transaction signature"
-            confidence = 92
-        elif gt == 0:
-            cause = "Legacy rider has no matching GFL transaction signature"
-            confidence = 92
+            evidence = (
+                f"Same date/time/bus/category exists in both systems: {base[0]} {base[1]}, bus {base[2] or '?'}, {base[3]}. "
+                f"Both contain {lt:g} rider(s), but {assignment_diff:g} rider(s) have a different assignment ({assign_kind.lower() or 'assignment differs'})."
+            )
+        elif count_diff < 0:
+            issue_type = "Missing from GFL"
+            cause = "Legacy rider has no matching GFL rider at the same timestamp/bus/category"
+            confidence = 96 if base[1] and base[2] else 92
+            evidence = (
+                f"At {base[0]} {base[1]}, bus {base[2] or '?'}, {base[3]}: Legacy has {lt:g} rider(s) and GFL has {gt:g}. "
+                f"Missing from GFL={missing_from_gfl:g}."
+            )
+        elif count_diff > 0:
+            issue_type = "Extra in GFL"
+            cause = "GFL rider has no matching Legacy rider at the same timestamp/bus/category"
+            confidence = 96 if base[1] and base[2] else 92
+            evidence = (
+                f"At {base[0]} {base[1]}, bus {base[2] or '?'}, {base[3]}: Legacy has {lt:g} rider(s) and GFL has {gt:g}. "
+                f"Extra in GFL={extra_in_gfl:g}."
+            )
         else:
-            cause = "Partial transaction-count mismatch after timestamp/bus/category matching"
+            issue_type = "Transaction mismatch"
+            cause = "Transaction mismatch"
             confidence = 88
-        evidence = (
-            f"Matched on date={base[0]}, timestamp={base[1]}, bus={base[2] or '?'}, category={base[3]}. "
-            f"Legacy={lt:g}, GFL riders={gt:g}, exact same route/run/trip assignment={exact:g}."
-        )
+            evidence = (
+                f"Matched on date/time/bus/category. Legacy={lt:g}, GFL riders={gt:g}, assignment difference={assignment_diff:g}."
+            )
+
         rows.append({
             "Date": base[0], "Timestamp": base[1], "Bus": base[2], "Identifier": base[3],
-            "Legacy Count": lt, "GFL Riders": gt, "Exact Assignment Matches": exact,
-            "Assignment Difference": assignment_diff, "Count Difference": count_diff,
+            "Issue Type": issue_type, "Assignment Kind": assign_kind,
+            "Legacy Count": lt, "GFL Riders": gt, "Missing from GFL": missing_from_gfl, "Extra in GFL": extra_in_gfl,
+            "Exact Assignment Matches": exact, "Assignment Difference": assignment_diff, "Count Difference": count_diff,
             "Legacy Assignments": _assignment_text(la), "GFL Assignments": _assignment_text(ga),
             "Likely Cause": cause, "Confidence %": confidence, "Evidence": evidence,
         })
@@ -210,4 +253,6 @@ def match_remaining_transactions(gfl_path: str, legacy_path: str, targets: Itera
         return pd.DataFrame(columns=columns)
     out = pd.DataFrame(rows)
     out["_priority"] = out["Count Difference"].abs() + out["Assignment Difference"]
-    return out.sort_values(["_priority", "Date", "Identifier"], ascending=[False, True, True]).drop(columns="_priority").reset_index(drop=True)
+    issue_order = {"Missing from GFL": 0, "Extra in GFL": 1, "Assignment difference": 2, "Transaction mismatch": 3}
+    out["_issue_order"] = out["Issue Type"].map(issue_order).fillna(9)
+    return out.sort_values(["Date", "_issue_order", "_priority", "Timestamp", "Identifier"], ascending=[True, True, False, True, True]).drop(columns=["_priority", "_issue_order"]).reset_index(drop=True)

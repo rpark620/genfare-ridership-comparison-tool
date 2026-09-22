@@ -26,7 +26,7 @@ with st.expander("Upload guidance", expanded=False):
 
 **Strongly recommended**
 
-- **GDS Legacy Transaction Detail** *(Transaction Report > Transaction Detail Report)* — CSV enables daily reconstruction, fare-category comparison, route/run/bus localization, equal-and-opposite movement detection, and targeted transaction matching.
+- **GDS Legacy Transaction Detail** *(Transaction Report > Transaction Detail Report)* — CSV enables daily reconstruction, fare-category comparison, route/run/bus localization, aggregate location-offset clues and exact transaction matching.
 
 **Scope:** ridership only. Revenue is intentionally excluded.
 """
@@ -84,27 +84,29 @@ def _fmt_diff(v) -> str:
 
 
 def _key_ttp_display(df: pd.DataFrame) -> pd.DataFrame:
-    """Compact numeric comparison that stays within the page width.
-
-    Cause/evidence text is rendered below the table instead of as very wide columns.
-    """
+    """Compact fare-category comparison with missing/extra riders stated directly."""
     if df is None or df.empty:
         return pd.DataFrame()
+    work = df.copy()
+    rider_diff = pd.to_numeric(work.get("Rider Difference"), errors="coerce").fillna(0)
+    work["Missing from GFL"] = (-rider_diff).clip(lower=0)
+    work["Extra in GFL"] = rider_diff.clip(lower=0)
     wanted = [
         ("Category", "Identifier", "Identifier"),
         ("Legacy", "Events", "Legacy Events"),
         ("Legacy", "Expected riders", "Legacy Expected Riders"),
         ("GenfareLink", "Records", "GFL Ridership Records"),
         ("GenfareLink", "Riders", "GFL Riders"),
-        ("Difference", "Records", "Record Difference"),
-        ("Difference", "Riders", "Rider Difference"),
+        ("Systemwide rider issue", "Missing from GFL", "Missing from GFL"),
+        ("Systemwide rider issue", "Extra in GFL", "Extra in GFL"),
+        ("Record check", "GFL - Legacy", "Record Difference"),
     ]
     data, cols = {}, []
     for group, label, source in wanted:
-        if source in df.columns:
+        if source in work.columns:
             key = (group, label)
             cols.append(key)
-            data[key] = df[source].values
+            data[key] = work[source].values
     out = pd.DataFrame(data)
     if cols:
         out.columns = pd.MultiIndex.from_tuples(cols)
@@ -129,22 +131,26 @@ def _render_problem_summaries(df: pd.DataFrame, max_items: int = 12):
 def _location_display(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
+    work = df.copy()
+    delta = pd.to_numeric(work.get("Record Difference"), errors="coerce").fillna(0)
+    work["Legacy excess here"] = (-delta).clip(lower=0)
+    work["GFL excess here"] = delta.clip(lower=0)
     wanted = []
     for c in ["Route", "Run", "Bus", "Identifier"]:
-        if c in df.columns:
+        if c in work.columns:
             wanted.append(("Location", c, c))
     wanted += [
         ("Legacy", "Rider events", "Legacy Events"),
-        ("GenfareLink", "Ridership records", "GFL Ridership Records"),
         ("GenfareLink", "Riders", "GFL Riders"),
-        ("Difference", "Records", "Record Difference"),
+        ("Location difference", "Legacy excess here", "Legacy excess here"),
+        ("Location difference", "GFL excess here", "GFL excess here"),
     ]
     data, cols = {}, []
     for group, label, source in wanted:
-        if source in df.columns:
+        if source in work.columns:
             key = (group, label)
             cols.append(key)
-            data[key] = df[source].values
+            data[key] = work[source].values
     out = pd.DataFrame(data)
     if cols:
         out.columns = pd.MultiIndex.from_tuples(cols)
@@ -156,10 +162,11 @@ def _movement_display(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     wanted = [
         ("Category", "Identifier", "Identifier"),
-        ("Movement", "Level", "Level"),
-        ("Movement", "Legacy location", "Legacy Location"),
-        ("Movement", "GFL location", "GFL Location"),
-        ("Movement", "Count", "Count"),
+        ("Aggregate clue", "Level", "Level"),
+        ("Aggregate clue", "Shared context", "Shared Context"),
+        ("Aggregate clue", "Legacy location", "Legacy Location"),
+        ("Aggregate clue", "GFL location", "GFL Location"),
+        ("Aggregate clue", "Count", "Count"),
         ("Evidence", "Score", "Confidence %"),
     ]
     data, cols = {}, []
@@ -181,11 +188,13 @@ def _tx_display(df: pd.DataFrame) -> pd.DataFrame:
         ("Match", "Timestamp", "Timestamp"),
         ("Match", "Bus", "Bus"),
         ("Match", "Identifier", "Identifier"),
-        ("Legacy", "Count", "Legacy Count"),
+        ("Result", "Issue", "Issue Type"),
+        ("Legacy", "Riders", "Legacy Count"),
         ("GenfareLink", "Riders", "GFL Riders"),
-        ("Difference", "Count", "Count Difference"),
-        ("Difference", "Assignment", "Assignment Difference"),
-        ("Match", "Exact assignments", "Exact Assignment Matches"),
+        ("True count issue", "Missing from GFL", "Missing from GFL"),
+        ("True count issue", "Extra in GFL", "Extra in GFL"),
+        ("Allocation only", "Assignment riders", "Assignment Difference"),
+        ("Allocation only", "What differs", "Assignment Kind"),
         ("Evidence", "Score", "Confidence %"),
     ]
     data, cols = {}, []
@@ -198,6 +207,43 @@ def _tx_display(df: pd.DataFrame) -> pd.DataFrame:
     if cols:
         out.columns = pd.MultiIndex.from_tuples(cols)
     return out
+
+
+def _render_day_transaction_summary(day_tx: pd.DataFrame):
+    """Separate real count loss/gain from riders that merely have different assignments."""
+    if day_tx is None or day_tx.empty:
+        return
+    work = day_tx.copy()
+    for c in ["Missing from GFL", "Extra in GFL", "Assignment Difference"]:
+        work[c] = pd.to_numeric(work.get(c, 0), errors="coerce").fillna(0)
+    missing = float(work["Missing from GFL"].sum())
+    extra = float(work["Extra in GFL"].sum())
+    assignment = float(work["Assignment Difference"].sum())
+
+    st.markdown("### What is actually different")
+    st.caption("Count issues change systemwide ridership. Assignment differences do **not** change the total — the rider exists in both systems but is attached to a different route/run/trip/driver.")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Missing from GFL", _fmt_num(missing))
+    c2.metric("Extra in GFL", _fmt_num(extra))
+    c3.metric("Net GFL - Legacy", _fmt_diff(extra - missing))
+    c4.metric("Same riders, different assignment", _fmt_num(assignment))
+
+    count_issues = work[(work["Missing from GFL"] > 0) | (work["Extra in GFL"] > 0)].copy()
+    if not count_issues.empty:
+        by_cat = count_issues.groupby("Identifier", as_index=False).agg({"Missing from GFL": "sum", "Extra in GFL": "sum"})
+        by_cat = by_cat[(by_cat["Missing from GFL"] > 0) | (by_cat["Extra in GFL"] > 0)]
+        by_bus = count_issues.groupby("Bus", as_index=False).agg({"Missing from GFL": "sum", "Extra in GFL": "sum"})
+        by_bus = by_bus[(by_bus["Missing from GFL"] > 0) | (by_bus["Extra in GFL"] > 0)]
+        left, right = st.columns(2)
+        with left:
+            st.markdown("**True count issues by fare category**")
+            st.dataframe(by_cat, width="stretch", hide_index=True)
+        with right:
+            st.markdown("**True count issues by bus**")
+            st.dataframe(by_bus, width="stretch", hide_index=True)
+    else:
+        st.success("No true missing/extra rider signatures were found for this day.")
+
 
 
 
@@ -224,7 +270,7 @@ def _render_day_drilldown(
 
     # Keep one selected day at a time. Widget interaction reruns only this fragment,
     # so the overall reconciliation above remains visible and does not rerun.
-    selected_key = "selected_day_v4_4"
+    selected_key = "selected_day_v4_6"
     valid_dates = day["Date"].astype(str).tolist()
     selected_date = st.session_state.get(selected_key)
     if selected_date not in valid_dates:
@@ -291,7 +337,7 @@ def _render_day_drilldown(
                     _render_day_card(drow)
     else:
         st.caption("Scroll horizontally within the date strip to view additional days.")
-        with st.container(horizontal=True, wrap=False, gap="small", key="day_strip_v4_4"):
+        with st.container(horizontal=True, wrap=False, gap="small", key="day_strip_v4_6"):
             for _, drow in day.iterrows():
                 with st.container(border=True, width=250):
                     _render_day_card(drow)
@@ -340,6 +386,9 @@ def _render_day_drilldown(
 
         date = str(selected_date)
         current = day_ident[day_ident["Date"].astype(str) == date].copy() if day_ident is not None and not day_ident.empty else pd.DataFrame()
+        day_tx_all = txm[txm["Date"].astype(str) == date].copy() if txm is not None and not txm.empty else pd.DataFrame()
+        if has_legacy_tx and not day_tx_all.empty:
+            _render_day_transaction_summary(day_tx_all)
 
         st.markdown("### Fare categories")
         if current.empty:
@@ -378,7 +427,8 @@ def _render_day_drilldown(
                         "success" if str(r["Likely Cause"]) == "Match" else "warning",
                     )
 
-        st.markdown("### Where it moved")
+        st.markdown("### Where the counts differ")
+        st.caption("These are location-level differences, not automatically missing riders. A Legacy excess at one location and GFL excess elsewhere may be the same riders reassigned. Exact transaction matching below is what confirms that.")
 
         def filt(df: pd.DataFrame) -> pd.DataFrame:
             if df is None or df.empty:
@@ -388,7 +438,7 @@ def _render_day_drilldown(
                 x = x[x["Identifier"].astype(str) == str(selected_identifier)]
             return x
 
-        rtab, runtab, bustab, movetab, exacttab = st.tabs(["Routes", "Runs", "Buses", "Equal & opposite", "Route + Run + Bus"])
+        rtab, runtab, bustab, movetab, exacttab = st.tabs(["Routes", "Runs", "Buses", "Aggregate offsets (unconfirmed)", "Route + Run + Bus"])
         with rtab:
             x = _problem_only(filt(route_cmp))
             if x.empty:
@@ -410,11 +460,11 @@ def _render_day_drilldown(
         with movetab:
             x = filt(movements)
             if x.empty:
-                st.info("No exact equal-and-opposite movement was detected for the current day/category.")
+                st.info("No balancing aggregate offset was detected for the current day/category.")
             else:
                 st.dataframe(_movement_display(x), width="stretch", hide_index=True)
                 for _, r in x.head(5).iterrows():
-                    st.info(f"**{r['Likely Cause']}** — {r['Evidence']} (evidence score {int(r['Confidence %'])}%)")
+                    st.info(f"**{r['Likely Cause']}** — {r['Evidence']} (aggregate evidence score {int(r['Confidence %'])}%)")
         with exacttab:
             x = _problem_only(filt(exact_cmp))
             if x.empty:
@@ -423,6 +473,7 @@ def _render_day_drilldown(
                 st.dataframe(_location_display(x), width="stretch", hide_index=True)
 
         st.markdown("### Transaction match")
+        st.caption("This is the confirmation layer. Matching uses the same date + exact timestamp + bus + fare category. Count issues are separated from assignment-only differences.")
         if not has_legacy_tx:
             st.info("Upload GDS Legacy Transaction Detail to enable transaction matching.")
         elif txm is None or txm.empty:
@@ -434,12 +485,36 @@ def _render_day_drilldown(
             if txview.empty:
                 st.success("No remaining transaction mismatch for the current day/category.")
             else:
-                st.dataframe(_tx_display(txview), width="stretch", hide_index=True)
-                top = txview.iloc[0]
-                _summary_box("Most specific remaining issue", str(top["Likely Cause"]), str(top["Evidence"]), "warning")
-                with st.expander("Show assignment details for the top mismatch"):
-                    st.markdown(f"**Legacy assignments:** {top.get('Legacy Assignments', '—')}")
-                    st.markdown(f"**GenfareLink assignments:** {top.get('GFL Assignments', '—')}")
+                for c in ["Missing from GFL", "Extra in GFL", "Assignment Difference"]:
+                    txview[c] = pd.to_numeric(txview.get(c, 0), errors="coerce").fillna(0)
+                count_view = txview[(txview["Missing from GFL"] > 0) | (txview["Extra in GFL"] > 0)].copy()
+                assign_view = txview[(txview["Missing from GFL"] == 0) & (txview["Extra in GFL"] == 0) & (txview["Assignment Difference"] > 0)].copy()
+
+                count_tab, assign_tab, all_tab = st.tabs(["Missing / extra riders", "Assignment differences", "All transaction findings"])
+                with count_tab:
+                    if count_view.empty:
+                        st.success("No true missing or extra rider signatures for this selection.")
+                    else:
+                        st.error(f"True count issue: {count_view['Missing from GFL'].sum():g} missing from GFL and {count_view['Extra in GFL'].sum():g} extra in GFL for this selection.")
+                        st.dataframe(_tx_display(count_view), width="stretch", hide_index=True)
+                        for _, r in count_view.head(8).iterrows():
+                            st.markdown(f"**{r['Issue Type']} — {r['Timestamp']} / Bus {r['Bus']} / {r['Identifier']}**  \n{r['Evidence']}")
+                with assign_tab:
+                    if assign_view.empty:
+                        st.success("No assignment-only differences for this selection.")
+                    else:
+                        st.info(f"{assign_view['Assignment Difference'].sum():g} rider(s) exist in both systems but have a different route/run/trip/driver assignment. These do **not** change systemwide ridership.")
+                        st.dataframe(_tx_display(assign_view), width="stretch", hide_index=True)
+                        with st.expander("Show assignment details"):
+                            for _, r in assign_view.head(12).iterrows():
+                                st.markdown(
+                                    f"**{r['Timestamp']} · Bus {r['Bus']} · {r['Identifier']} · {r.get('Assignment Kind', 'Assignment differs')}**  \n"
+                                    f"Legacy: {r.get('Legacy Assignments', '—')}  \n"
+                                    f"GFL: {r.get('GFL Assignments', '—')}"
+                                )
+                with all_tab:
+                    st.dataframe(_tx_display(txview), width="stretch", hide_index=True)
+
 
 def _build_payload():
     missing = []
@@ -503,16 +578,16 @@ if run:
     try:
         payload = _build_payload()
         if payload is not None:
-            st.session_state["reconciliation_payload_v4_4"] = payload
+            st.session_state["reconciliation_payload_v4_6"] = payload
             # Close any day drill-downs from the previous reconciliation.
             for key in list(st.session_state.keys()):
-                if str(key).startswith("open_day_") or str(key).startswith("select_day_") or str(key).startswith("identifier_") or str(key) == "selected_day_v4_4":
-                    if key != "reconciliation_payload_v4_4":
+                if str(key).startswith("open_day_") or str(key).startswith("select_day_") or str(key).startswith("identifier_") or str(key) == "selected_day_v4_6":
+                    if key != "reconciliation_payload_v4_6":
                         del st.session_state[key]
     except Exception as exc:
         st.exception(exc)
 
-payload = st.session_state.get("reconciliation_payload_v4_4")
+payload = st.session_state.get("reconciliation_payload_v4_6")
 if payload is not None:
     result = payload["result"]
     diagnostics_df = payload["diagnostics_df"]
@@ -594,7 +669,7 @@ if payload is not None:
         st.download_button(
             "Download summary CSV",
             data=to_csv_bytes(f),
-            file_name="ridership_reconciliation_summary_v4_3.csv",
+            file_name="ridership_reconciliation_summary_v4_6.csv",
             mime="text/csv",
             use_container_width=True,
         )
@@ -602,7 +677,7 @@ if payload is not None:
         st.download_button(
             "Download full drill-down Excel",
             data=to_excel_bytes(result, diagnostics_df),
-            file_name="ridership_reconciliation_full_v4_3.xlsx",
+            file_name="ridership_reconciliation_full_v4_6.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )
@@ -614,7 +689,7 @@ if payload is not None:
         st.download_button(
             "Download AI evidence JSON",
             data=to_ai_json_bytes(result, diagnostics_df),
-            file_name="ridership_ai_evidence_v4_3.json",
+            file_name="ridership_ai_evidence_v4_6.json",
             mime="application/json",
             use_container_width=True,
         )
@@ -622,7 +697,7 @@ if payload is not None:
         st.download_button(
             "Download AI review prompt",
             data=to_ai_prompt_bytes(),
-            file_name="ridership_ai_review_prompt_v4_3.md",
+            file_name="ridership_ai_review_prompt_v4_6.md",
             mime="text/markdown",
             use_container_width=True,
         )

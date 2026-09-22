@@ -135,9 +135,12 @@ def build_day_identifier_comparison(gfl: LargeCSVProfile, legacy_tx: Optional[La
             if rule is False and gfl_riders > 0:
                 summary = f"Legacy expects 0 riders, but GFL contributes {gfl_riders:g}"
                 cause = "Ridership-rule/configuration difference"
+            elif rider_diff < 0:
+                summary = f"{-rider_diff:g} rider(s) are missing from GFL for this fare category"
+                cause = "Missing GFL rider records or report-scope/filter difference"
             else:
-                summary = f"Rider contribution differs by {rider_diff:+g}"
-                cause = "Missing/extra ridership records, report scope difference, or configuration difference"
+                summary = f"{rider_diff:g} extra GFL rider(s) exist for this fare category"
+                cause = "Extra GFL rider records or report-scope/filter difference"
         elif rule is True and abs(record_diff) > 1e-9:
             summary = f"Rider totals reconcile, but raw record counts differ by {record_diff:+g}"
             cause = "Duplicate/zero-ridership row behavior or report-recording difference"
@@ -197,6 +200,12 @@ def _aggregate_dimension(detail: pd.DataFrame, dims: list[str]) -> pd.DataFrame:
 
 
 def _pair_offsets(df: pd.DataFrame, context_cols: list[str], location_col: str, level: str) -> list[dict]:
+    """Find balancing aggregate offsets inside a shared context.
+
+    These are clues only. They are deliberately not called confirmed reassignments because
+    aggregate counts do not prove the same rider moved. Exact timestamp/bus/category
+    transaction matching is the confirmation layer.
+    """
     results = []
     if df.empty:
         return results
@@ -217,18 +226,23 @@ def _pair_offsets(df: pd.DataFrame, context_cols: list[str], location_col: str, 
                 ctx = dict(zip(context_cols, context))
                 identifier = str(ctx.get("Identifier", ""))
                 date = str(ctx.get("Date", ""))
+                context_bits = [f"{c} {ctx.get(c)}" for c in context_cols if c not in {"Date", "Identifier"} and str(ctx.get(c, "")) not in {"", "0", "nan"}]
+                shared_context = " / ".join(context_bits) if context_bits else "same day/category"
                 if level == "Route":
-                    cause = "Likely route reassignment / Legacy Data Edit"
-                    conf = 96
+                    cause = "Aggregate route offset — possible reassignment, not yet confirmed"
+                    conf = 78
                 elif level == "Run":
-                    cause = "Likely run reassignment within the same route"
-                    conf = 93
+                    cause = "Aggregate run offset — possible reassignment, not yet confirmed"
+                    conf = 74
                 else:
-                    cause = "Likely bus assignment/reporting difference"
-                    conf = 90
-                evidence = f"{date} {identifier}: equal-and-opposite {amount:g}-event movement from {level} {from_loc} in Legacy to {level} {to_loc} in GFL; total category count for this comparison context is unchanged."
+                    cause = "Aggregate bus offset — possible assignment difference, not yet confirmed"
+                    conf = 70
+                evidence = (
+                    f"{date} {identifier}: {amount:g} event(s) balance from {level} {from_loc} in Legacy to {level} {to_loc} in GFL "
+                    f"within {shared_context}. This is an aggregate clue only; confirm with exact timestamp/bus/category transaction matching below."
+                )
                 results.append({
-                    "Date": date, "Identifier": identifier, "Level": level,
+                    "Date": date, "Identifier": identifier, "Level": level, "Shared Context": shared_context,
                     "Legacy Location": from_loc, "GFL Location": to_loc, "Count": amount,
                     "Likely Cause": cause, "Confidence %": conf, "Evidence": evidence,
                 })
@@ -251,10 +265,16 @@ def build_specific_comparisons(gfl: LargeCSVProfile, legacy_tx: Optional[LargeCS
     route = _aggregate_dimension(detail, ["Route"])
     run = _aggregate_dimension(detail, ["Route", "Run"])
     bus = _aggregate_dimension(detail, ["Route", "Bus"])
+
+    # Movement clues are paired only inside a meaningful shared context so a deficit on
+    # one bus is never paired with a surplus on a different bus and presented as one move.
+    route_by_bus = _aggregate_dimension(detail, ["Bus", "Route"])
+    run_by_route_bus = _aggregate_dimension(detail, ["Route", "Bus", "Run"])
+    bus_by_route_run = _aggregate_dimension(detail, ["Route", "Run", "Bus"])
     movement_rows = []
-    movement_rows += _pair_offsets(route, ["Date", "Identifier"], "Route", "Route")
-    movement_rows += _pair_offsets(run, ["Date", "Identifier", "Route"], "Run", "Run")
-    movement_rows += _pair_offsets(bus, ["Date", "Identifier", "Route"], "Bus", "Bus")
+    movement_rows += _pair_offsets(route_by_bus, ["Date", "Identifier", "Bus"], "Route", "Route")
+    movement_rows += _pair_offsets(run_by_route_bus, ["Date", "Identifier", "Route", "Bus"], "Run", "Run")
+    movement_rows += _pair_offsets(bus_by_route_run, ["Date", "Identifier", "Route", "Run"], "Bus", "Bus")
     movements = pd.DataFrame(movement_rows)
     if not movements.empty:
         movements = movements.sort_values(["Date", "Count", "Identifier"], ascending=[True, False, True]).reset_index(drop=True)
